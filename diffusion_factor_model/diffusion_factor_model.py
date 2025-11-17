@@ -540,6 +540,8 @@ class GaussianDiffusion(Module):
         assert not hasattr(model, 'random_or_learned_sinusoidal_cond') or not model.random_or_learned_sinusoidal_cond
 
         self.model = model
+        self.is_transformer_backbone = hasattr(model, 'x_embedder')
+        self.supports_causal_mask = getattr(model, 'supports_causal_mask', False)
 
         self.channels = self.model.in_channels
         self.self_condition = False
@@ -648,13 +650,32 @@ class GaussianDiffusion(Module):
     
     def noise_pos(self, x, i):
         B, L, device = *x.shape, x.device
-        M = torch.arange(L, device=device).unsqueeze(0) == i.unsqueeze(1)         # [B, L]
-        M = M.float()
-
-        idx = torch.arange(L, device=device).unsqueeze(0)
-        causal_mask = (idx <= i.unsqueeze(1)).float()
+        indices = torch.arange(L, device=device).unsqueeze(0)
+        M = (indices == i.unsqueeze(1)).float()
+        causal_mask = (indices <= i.unsqueeze(1)).float()
 
         return M, causal_mask
+
+    def _compute_patch_mask(self, causal_mask):
+        if not self.supports_causal_mask:
+            return None
+
+        patch_size = getattr(self.model, 'patch_size', 1)
+        b, _ = causal_mask.shape
+        if patch_size == 1:
+            return causal_mask.bool()
+
+        h, w = self.image_size
+        if (h % patch_size) != 0 or (w % patch_size) != 0:
+            raise ValueError(
+                f"Image size {(h, w)} must be divisible by DiT patch size {patch_size}"
+            )
+
+        mask_2d = causal_mask.view(b, h, w) > 0
+        mask_2d = mask_2d.view(b, h // patch_size, patch_size, w // patch_size, patch_size)
+        mask_2d = mask_2d.permute(0, 1, 3, 2, 4).reshape(b, -1, patch_size * patch_size)
+        patch_mask = mask_2d.any(dim=-1)
+        return patch_mask
 
     def predict_start_from_noise(self, x_t, t, noise):
         return (
@@ -691,14 +712,17 @@ class GaussianDiffusion(Module):
 
     def model_predictions(self, x, t, i, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
         # Determine noise injection positions
-        M = torch.zeros(x.shape, device = self.device)
-        M[:, i] = torch.ones(M[:, i].shape, device = self.device)
-        
+        M, causal_mask = self.noise_pos(x, i)
+        patch_mask = self._compute_patch_mask(causal_mask) if self.supports_causal_mask else None
+
         # reshape x before feeding into DiT
         h, w = self.image_size
         x = x.reshape(-1, 1, h, w)
-        
-        model_output = self.model(x, t, i, None)
+
+        if self.is_transformer_backbone:
+            model_output = self.model(x, t, i, None, attn_mask=patch_mask)
+        else:
+            model_output = self.model(x, t, x_self_cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         # reshape x back and zero out entries other than i
@@ -1011,6 +1035,7 @@ class GaussianDiffusion(Module):
 
         noise = default(noise, lambda: torch.randn_like(x_start))
         M, causal_mask = self.noise_pos(x_start, i)
+        patch_mask = self._compute_patch_mask(causal_mask) if self.supports_causal_mask else None
 
         offset_noise_strength = default(offset_noise_strength, self.offset_noise_strength)
 
@@ -1038,7 +1063,10 @@ class GaussianDiffusion(Module):
         x = x.reshape(-1, 1, h, w)
 
         # predict and take gradient step
-        model_out = self.model(x, t, i, x_self_cond)
+        if self.is_transformer_backbone:
+            model_out = self.model(x, t, i, None, attn_mask=patch_mask)
+        else:
+            model_out = self.model(x, t, x_self_cond)
         model_out = model_out.view(model_out.size(0), -1)
         model_out = model_out * M
 
