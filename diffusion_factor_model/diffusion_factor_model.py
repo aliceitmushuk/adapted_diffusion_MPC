@@ -677,6 +677,22 @@ class GaussianDiffusion(Module):
         patch_mask = mask_2d.any(dim=-1)
         return patch_mask
 
+    def _project_to_index(self, tensor, indices, template, mask=None):
+        """Select predictions at index `i` and scatter them back to feature space."""
+        flat = tensor.view(tensor.shape[0], -1)
+        if flat.shape[1] != template.shape[1]:
+            raise ValueError(
+                f"Tensor width {flat.shape[1]} must match template width {template.shape[1]}"
+            )
+
+        if mask is not None:
+            return flat * mask
+
+        gathered = flat.gather(1, indices.unsqueeze(1))
+        projected = torch.zeros_like(template)
+        projected.scatter_(1, indices.unsqueeze(1), gathered)
+        return projected
+
     def predict_start_from_noise(self, x_t, t, noise):
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
@@ -711,42 +727,45 @@ class GaussianDiffusion(Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def model_predictions(self, x, t, i, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        # Determine noise injection positions
-        M, causal_mask = self.noise_pos(x, i)
+        flat_x = x.view(x.shape[0], -1)
+        M, causal_mask = self.noise_pos(flat_x, i)
         patch_mask = self._compute_patch_mask(causal_mask) if self.supports_causal_mask else None
 
         # reshape x before feeding into DiT
         h, w = self.image_size
-        x = x.reshape(-1, 1, h, w)
+        x_reshaped = flat_x.reshape(-1, 1, h, w)
 
         if self.is_transformer_backbone:
-            model_output = self.model(x, t, i, None, attn_mask=patch_mask)
+            model_output = self.model(x_reshaped, t, i, None, attn_mask=patch_mask)
         else:
-            model_output = self.model(x, t, x_self_cond)
+            model_output = self.model(x_reshaped, t, x_self_cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
-        # reshape x back and zero out entries other than i
-        x = x.view(model_output.size(0), -1) * M
-        
+        projected = self._project_to_index(
+            model_output,
+            i,
+            template=flat_x,
+            mask=None if self.supports_causal_mask else M
+        )
 
         if self.objective == 'pred_noise':
-            pred_noise = model_output.view(model_output.size(0), -1) * M
-            x_start = self.predict_start_from_noise(x, t, pred_noise)
+            pred_noise = projected
+            x_start = self.predict_start_from_noise(flat_x, t, pred_noise)
             x_start = maybe_clip(x_start)
 
             if clip_x_start and rederive_pred_noise:
-                pred_noise = self.predict_noise_from_start(x, t, x_start)
+                pred_noise = self.predict_noise_from_start(flat_x, t, x_start)
 
         elif self.objective == 'pred_x0':
-            x_start = model_output.view(model_output.size(0), -1) * M
+            x_start = projected
             x_start = maybe_clip(x_start)
-            pred_noise = self.predict_noise_from_start(x, t, x_start)
+            pred_noise = self.predict_noise_from_start(flat_x, t, x_start)
 
         elif self.objective == 'pred_v':
-            v = model_output
-            x_start = self.predict_start_from_v(x, t, v)
+            v = projected
+            x_start = self.predict_start_from_v(flat_x, t, v)
             x_start = maybe_clip(x_start)
-            pred_noise = self.predict_noise_from_start(x, t, x_start)
+            pred_noise = self.predict_noise_from_start(flat_x, t, x_start)
 
         return ModelPrediction(pred_noise, x_start)
 
@@ -1022,8 +1041,8 @@ class GaussianDiffusion(Module):
         x_t = x_start + M * ((sqrt_alpha - 1.0) * x_start + sqrt_oma * noise)
 
         # now zero out all positions after i  (enforcing causality)
-        
-        x_t = x_t * causal_mask
+        if not self.supports_causal_mask:
+            x_t = x_t * causal_mask
 
         return x_t
     
@@ -1060,23 +1079,43 @@ class GaussianDiffusion(Module):
 
         # reshape before feeding into model
         h, w = self.image_size
-        x = x.reshape(-1, 1, h, w)
+        flat_x = x.view(x.shape[0], -1)
+        x = flat_x.reshape(-1, 1, h, w)
 
         # predict and take gradient step
         if self.is_transformer_backbone:
             model_out = self.model(x, t, i, None, attn_mask=patch_mask)
         else:
             model_out = self.model(x, t, x_self_cond)
-        model_out = model_out.view(model_out.size(0), -1)
-        model_out = model_out * M
+        model_out = self._project_to_index(
+            model_out,
+            i,
+            template=flat_x,
+            mask=None if self.supports_causal_mask else M
+        )
 
         if self.objective == 'pred_noise':
-            target = noise * M
+            target = self._project_to_index(
+                noise,
+                i,
+                template=flat_x,
+                mask=None if self.supports_causal_mask else M
+            )
         elif self.objective == 'pred_x0':
-            target = x_start * M
+            target = self._project_to_index(
+                x_start,
+                i,
+                template=flat_x,
+                mask=None if self.supports_causal_mask else M
+            )
         elif self.objective == 'pred_v':
             v = self.predict_v(x_start, t, noise)
-            target = v
+            target = self._project_to_index(
+                v,
+                i,
+                template=flat_x,
+                mask=None if self.supports_causal_mask else M
+            )
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
