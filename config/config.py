@@ -43,8 +43,8 @@ BETA_SCHEDULE = 'cosine'
 AUTO_NORMALIZE = False
 
 # Training parameters
-BATCH_SIZE = 256
-LEARNING_RATE = 1e-3
+BATCH_SIZE = 1024
+LEARNING_RATE = 1e-4
 EPOCHS = 1000
 WEIGHT_DECAY = 0.01
 USE_COSINE_SCHEDULER = True
@@ -60,8 +60,8 @@ SPLIT_BATCHES = False
 SAVE_INTERVAL = 100       # Save checkpoint every N epochs
 
 # Sampling parameters
-SAMPLE_BATCHES = 64       # Number of batches to sample
-SAMPLES_PER_BATCH = 128   # Number of samples per batch
+SAMPLE_BATCHES = 2       # Number of batches to sample
+SAMPLES_PER_BATCH = 4096   # Number of samples per batch
 SAVE_TIMESTEPS = [20]     # Specific timesteps to save for early stopping evaluation (e.g., [100, 200, 500])
                           # Set to None to save only final denoised samples
                           # Set to a list like [100, 200, 500] to save samples at those timesteps

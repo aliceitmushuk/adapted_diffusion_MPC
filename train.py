@@ -9,6 +9,8 @@ import os
 import gc
 import argparse
 import time
+from tqdm import tqdm
+
 
 from diffusion_factor_model.diffusion_factor_model import Unet, GaussianDiffusion, Trainer
 import config.config as config
@@ -40,7 +42,7 @@ def get_dim_mults_for_size(height, width):
     else:
         return config.DIM_MULTS_MINIMAL # Minimal case
 
-def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, save_timesteps=None):
+def train_model(data_path, seed=None, num_samples=None, num_features=None, gpu_id=0, epochs=None, save_timesteps=None):
     """
     Train the diffusion model using a specific data file
     
@@ -80,6 +82,12 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
     if num_samples is not None and num_samples < data_shape[0]:
         data_np = data_np[:num_samples]
         print(f"Using {num_samples} samples from the data")
+
+    # Limit number of features if specified
+    if num_features is not None and num_features < data_shape[1]:
+        data_np = data_np[:, :num_features]
+        print(f"Using {num_features} features from the data")
+        data_shape = data_np.shape
     
     # Determine data dimensions and reshape strategy
     if len(data_shape) == 2:
@@ -99,8 +107,10 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
         if data.shape[1] != features:
             print(f"Warning: Data dimension ({data.shape[1]}) doesn't match expected features ({features})")
         
-        data = data.reshape(-1, 1, height, width)
-        print(f"Reshaped 2D data to: {data.shape} with dimensions [batch, channels, height={height}, width={width}]")
+
+        # # data = data.reshape(-1, 1, height, width)
+        # data = data.reshape(-1, 1, samples, features)
+        # print(f"Reshaped 2D data to: {data.shape} with dimensions [batch, channels, height={height}, width={width}]")
         
     elif len(data_shape) == 3:
         # data (samples, height, width) - add channel dimension
@@ -156,9 +166,9 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
             input_size=(height, width),
             patch_size=2,
             in_channels=1,
-            hidden_size=1024,
-            depth=24,
-            num_heads=16,
+            hidden_size=256,
+            depth=12,
+            num_heads=8,
             class_dropout_prob=0.0,
             num_classes=1,
             learn_sigma=False,
@@ -223,18 +233,21 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
     
     config.set_seed(seed)  # Reset seed for reproducibility
     
-    for i in range(sample_batches):
-        # Pass save_timesteps parameter to sample method for early stopping evaluation
-        samples = diffusion.sample(batch_size=samples_per_batch, save_timesteps=save_timesteps)
-        samples = samples.view(samples.size(0), -1).cpu().numpy()
-        samples = samples * data_std.view(-1).cpu().numpy() + data_mean.view(-1).cpu().numpy()
-        
-        sample_file = os.path.join(sample_dir, f"sample_batch{i+1}.npy")
-        np.save(sample_file, samples)
-        
-        # Clean up to prevent memory issues
-        del samples
-        gc.collect()
+    for j in range(sample_batches):
+        with tqdm(total=features, 
+              desc=f"Batch {j+1}/{sample_batches}",
+              dynamic_ncols=True) as pbar:
+            # Pass save_timesteps parameter to sample method for early stopping evaluation
+            samples = diffusion.sample(batch_size=samples_per_batch, save_timesteps=save_timesteps, pbar=pbar)
+            samples = samples.cpu().numpy()
+            samples = samples * data_std.view(-1).cpu().numpy() + data_mean.view(-1).cpu().numpy()
+            
+            sample_file = os.path.join(sample_dir, f"sample_batch{j+1}.npy")
+            np.save(sample_file, samples)
+            
+            # Clean up to prevent memory issues
+            del samples
+            gc.collect()
     
     # Clean up
     del trainer, model, diffusion, data, dataset
@@ -254,6 +267,8 @@ if __name__ == "__main__":
                       help="Random seed")
     parser.add_argument("--num_samples", type=int, default=None, 
                       help="Number of training samples (None = use all)")
+    parser.add_argument("--num_features", type=int, default=None, 
+                      help="Number of features (None = use all)")
     parser.add_argument("--gpu", type=int, default=0, 
                       help="GPU ID")
     parser.add_argument("--epochs", type=int, default=None, 
@@ -265,4 +280,4 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    train_model(args.data_path, args.seed, args.num_samples, args.gpu, args.epochs, args.save_timesteps) 
+    train_model(args.data_path, args.seed, args.num_samples, args.num_features, args.gpu, args.epochs, args.save_timesteps) 
