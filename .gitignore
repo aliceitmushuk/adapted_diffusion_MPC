@@ -179,3 +179,5 @@ Evalution_factor.ipynb
 config/config.py
 model_results/
 samples/
+
+*.npy
