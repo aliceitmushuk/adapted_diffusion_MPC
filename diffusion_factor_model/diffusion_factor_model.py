@@ -1213,13 +1213,39 @@ class SequentialGaussianDiffusion(Module):
         return self.p_losses(sequences, t, target_indices, *args, **kwargs)
 
     @torch.inference_mode()
-    def sample(self, batch_size=16, save_timesteps=None, return_all_timesteps=False):
+    def sample(
+        self,
+        batch_size=16,
+        save_timesteps=None,
+        return_all_timesteps=False,
+        start_idx=0,
+        end_idx=None,
+        show_progress=False,
+        progress_desc=None,
+    ):
         sequences = torch.zeros(batch_size, self.seq_len, device=self.device)
         save_set = set(save_timesteps) if save_timesteps is not None else None
         saved = [] if save_set else None
         history = [] if return_all_timesteps else None
 
-        for pos in range(self.seq_len):
+        if end_idx is None:
+            end_idx = self.seq_len
+        start_idx = max(0, int(start_idx))
+        end_idx = min(self.seq_len, int(end_idx))
+        if start_idx >= end_idx:
+            raise ValueError("Sampling window must include at least one index")
+
+        indices_to_generate = list(range(start_idx, end_idx))
+        iterator = indices_to_generate
+        if show_progress:
+            iterator = tqdm(
+                indices_to_generate,
+                desc=progress_desc or "Sampling",
+                unit="index",
+                leave=False,
+            )
+
+        for pos in iterator:
             x_t = torch.randn(batch_size, device=self.device)
             target_indices = torch.full((batch_size,), pos, device=self.device, dtype=torch.long)
             for t in reversed(range(self.num_timesteps)):
@@ -1242,6 +1268,8 @@ class SequentialGaussianDiffusion(Module):
             sequences[:, pos] = x_t
             if return_all_timesteps:
                 history.append(sequences.clone())
+            if show_progress:
+                iterator.set_postfix(index=pos)
 
         if save_set:
             if len(saved) == 0:
@@ -1453,6 +1481,8 @@ class Trainer:
             num_batches = 0
             total_batches = len(self.dataloader)
             update_pbar_batches = total_batches  # // 2
+            grad_norm_total = 0.0
+            grad_norm_count = 0
             # Update scheduler for each epoch
             self.scheduler.step(epoch)
             
@@ -1470,6 +1500,11 @@ class Trainer:
 
                     # Update model parameters after accumulating `gradient_accumulate_every` batches
                     if (batch_idx + 1) % self.gradient_accumulate_every == 0:
+                        parameters = [p for p in self.model.parameters() if p.grad is not None]
+                        if parameters:
+                            grad_norm = torch.norm(torch.stack([p.grad.detach().norm(2) for p in parameters]), 2)
+                            grad_norm_total += grad_norm.item()
+                            grad_norm_count += 1
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.optimizer.zero_grad()
@@ -1487,11 +1522,16 @@ class Trainer:
 
                 # Log metrics at the end of the epoch
                 avg_train_loss = total_loss / num_batches
+                avg_grad_norm = grad_norm_total / grad_norm_count if grad_norm_count else 0.0
 
                 self.logger.add_scalar('Train/Average Loss', avg_train_loss, epoch)
+                self.logger.add_scalar('Train/Average Grad Norm', avg_grad_norm, epoch)
                 self.logger.flush()
 
-                self.accelerator.print(f"Epoch {epoch + 1}/{self.train_epochs} completed with avg loss {avg_train_loss:.4f}")
+                self.accelerator.print(
+                    f"Epoch {epoch + 1}/{self.train_epochs} completed with avg loss {avg_train_loss:.4f} "
+                    f"and avg grad norm {avg_grad_norm:.4f}"
+                )
 
                 # Save model and generate samples at the end of each epoch
                 if self.accelerator.is_main_process and (epoch + 1) % self.save_and_sample_every == 0:

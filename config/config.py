@@ -70,6 +70,8 @@ SAVE_INTERVAL = 1000       # Save checkpoint every N epochs
 SAMPLE_BATCHES = 64       # Number of batches to sample
 SAMPLES_PER_BATCH = 128   # Number of samples per batch
 SAVE_TIMESTEPS = None     # For sequential sampling, defaults to final output only
+SAMPLE_WINDOW_START = 0   # Default start index for sequential sampling windows
+SAMPLE_WINDOW_LENGTH = 32 # Number of sequential indices to generate by default (capped by sequence length)
 
 # Mixed precision settings
 USE_AMP = True            # Mixed precision training

@@ -17,7 +17,16 @@ from diffusion_factor_model.diffusion_factor_model import (
 )
 import config.config as config
 
-def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, save_timesteps=None):
+def train_model(
+    data_path,
+    seed=None,
+    num_samples=None,
+    gpu_id=0,
+    epochs=None,
+    save_timesteps=None,
+    sample_window_start=None,
+    sample_window_length=None,
+):
     """
     Train the diffusion model using a specific data file
     
@@ -27,8 +36,10 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
         num_samples: Number of training samples to use (None = use all)
         gpu_id: GPU ID to use
         epochs: Number of epochs to train (None = use config.EPOCHS)
-        save_timesteps: List of specific timesteps to save during sampling for early stopping evaluation 
+        save_timesteps: List of specific timesteps to save during sampling for early stopping evaluation
                        (None = use config.SAVE_TIMESTEPS, which defaults to None meaning save only final result)
+        sample_window_start: Optional start index (inclusive) for sequential sampling
+        sample_window_length: Optional number of sequential entries to generate
     """
     # Set GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -110,6 +121,25 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
     )
     
     print("Diffusion process initialized")
+
+    # Determine sampling window
+    window_start = sample_window_start
+    if window_start is None:
+        window_start = config.SAMPLE_WINDOW_START
+    window_start = max(0, int(window_start))
+
+    window_length = sample_window_length
+    if window_length is None:
+        window_length = config.SAMPLE_WINDOW_LENGTH
+    if window_length is None:
+        window_end = seq_len
+    else:
+        window_end = min(seq_len, window_start + max(1, int(window_length)))
+
+    if window_start >= seq_len:
+        raise ValueError(f"Sampling window start {window_start} exceeds sequence length {seq_len}")
+
+    print(f"Sampling window configured to indices [{window_start}, {window_end})")
     
     # Initialize Trainer with custom epochs and optional save_timesteps for early stopping
     trainer = Trainer(
@@ -151,7 +181,15 @@ def train_model(data_path, seed=None, num_samples=None, gpu_id=0, epochs=None, s
     
     for i in range(sample_batches):
         # Pass save_timesteps parameter to sample method for early stopping evaluation
-        samples = diffusion.sample(batch_size=samples_per_batch, save_timesteps=save_timesteps)
+        progress_desc = f"Sampling batch {i+1}/{sample_batches}"
+        samples = diffusion.sample(
+            batch_size=samples_per_batch,
+            save_timesteps=save_timesteps,
+            start_idx=window_start,
+            end_idx=window_end,
+            show_progress=True,
+            progress_desc=progress_desc,
+        )
         if samples.dim() == 3:
             # (batch, snapshots, seq_len)
             scaled = samples * data_std.unsqueeze(1) + data_mean.unsqueeze(1)
@@ -190,7 +228,20 @@ if __name__ == "__main__":
                       help="Number of epochs to train (None = use config value)")
     parser.add_argument("--save_timesteps", type=int, nargs='+', default=None,
                       help="Specific timesteps to save during sampling for early stopping evaluation (e.g., --save_timesteps 100 200 500)")
+    parser.add_argument("--sample_window_start", type=int, default=None,
+                      help="Start index (inclusive) for sequential sampling window")
+    parser.add_argument("--sample_window_length", type=int, default=None,
+                      help="Number of indices to generate in the sampling window")
     
     args = parser.parse_args()
     
-    train_model(args.data_path, args.seed, args.num_samples, args.gpu, args.epochs, args.save_timesteps) 
+    train_model(
+        args.data_path,
+        args.seed,
+        args.num_samples,
+        args.gpu,
+        args.epochs,
+        args.save_timesteps,
+        args.sample_window_start,
+        args.sample_window_length,
+    )
