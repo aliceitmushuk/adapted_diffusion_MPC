@@ -1,5 +1,6 @@
 import math
 import copy
+import warnings
 from pathlib import Path
 from random import random
 from functools import partial
@@ -434,6 +435,79 @@ class Unet(Module):
         x = self.final_res_block(x, t)
         return self.final_conv(x)
 
+class ConditionalTransformer(Module):
+    """Transformer that predicts the noise of one entry conditioned on history."""
+
+    def __init__(
+        self,
+        *,
+        seq_len,
+        dim=256,
+        depth=6,
+        heads=8,
+        ff_mult=4,
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.seq_len = seq_len
+        self.value_proj = nn.Linear(1, dim)
+        self.indicator_embed = nn.Embedding(2, dim)
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(dim),
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim)
+        )
+        self.pos_emb = nn.Parameter(torch.randn(seq_len, dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=heads,
+            dim_feedforward=int(dim * ff_mult),
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, depth)
+        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1)
+        mask = mask.masked_fill(mask == 1, float('-inf'))
+        self.register_buffer('causal_mask', mask)
+        self.dropout = nn.Dropout(dropout)
+        # Small prediction head so representation and scalar output can live in different spaces
+        self.output = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, 1)
+        )
+
+    def forward(self, values, target_indices, timesteps, key_padding_mask):
+        """Forward pass.
+
+        Args:
+            values: Tensor of shape [batch, seq_len] containing history and noisy entry.
+            target_indices: Long tensor [batch] for the index of the noisy entry.
+            timesteps: Long tensor [batch] for diffusion step.
+            key_padding_mask: Bool tensor [batch, seq_len] masking padded entries (True => ignore).
+        Returns:
+            Predicted noise scalar for each batch element.
+        """
+        batch, seq_len = values.shape
+        device = values.device
+        tokens = self.value_proj(values.unsqueeze(-1))
+        pos = self.pos_emb[:seq_len].unsqueeze(0)
+        tokens = tokens + pos
+        indicator = torch.zeros(batch, seq_len, dtype=torch.long, device=device)
+        indicator.scatter_(1, target_indices.unsqueeze(1), 1)
+        tokens = tokens + self.indicator_embed(indicator)
+        time_emb = self.time_mlp(timesteps.float())
+        tokens[torch.arange(batch, device=device), target_indices] += time_emb
+        tokens = self.dropout(tokens)
+        mask = self.causal_mask[:seq_len, :seq_len]
+        encoded = self.encoder(tokens, mask=mask, src_key_padding_mask=key_padding_mask)
+        target_states = encoded[torch.arange(batch, device=device), target_indices]
+        return self.output(target_states).squeeze(-1)
+
 # gaussian diffusion trainer class
 
 def extract(a, t, x_shape):
@@ -651,16 +725,16 @@ class GaussianDiffusion(Module):
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
         )
 
-    def predict_noise_from_start(self, x_t, t, x0):
-        return (
-            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
-            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
-        )
-
     def predict_v(self, x_start, t, noise):
         return (
             extract(self.sqrt_alphas_cumprod, t, x_start.shape) * noise -
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * x_start
+        )
+
+    def predict_noise_from_start(self, x_t, t, x0):
+        return (
+            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) / \
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         )
 
     def predict_start_from_v(self, x_t, t, v):
@@ -1015,6 +1089,195 @@ class GaussianDiffusion(Module):
         img = self.normalize(img)
         return self.p_losses(img, t, *args, **kwargs)
 
+class SequentialGaussianDiffusion(Module):
+    """Sequential diffusion process that denoises entries one-by-one."""
+
+    def __init__(
+        self,
+        model,
+        *,
+        seq_len,
+        timesteps=1000,
+        objective='pred_noise',
+        beta_schedule='cosine',
+        schedule_fn_kwargs=dict(),
+        auto_normalize=False,
+    ):
+        super().__init__()
+        self.model = model
+        self.seq_len = seq_len
+        self.objective = objective
+
+        if beta_schedule == 'linear':
+            beta_schedule_fn = linear_beta_schedule
+        elif beta_schedule == 'cosine':
+            beta_schedule_fn = cosine_beta_schedule
+        elif beta_schedule == 'sigmoid':
+            beta_schedule_fn = sigmoid_beta_schedule
+        else:
+            raise ValueError(f'unknown beta schedule {beta_schedule}')
+
+        betas = beta_schedule_fn(timesteps, **schedule_fn_kwargs)
+        alphas = 1. - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.)
+
+        self.num_timesteps = int(betas.shape[0])
+
+        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
+
+        register_buffer('betas', betas)
+        register_buffer('alphas_cumprod', alphas_cumprod)
+        register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+        register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+        register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
+        register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
+        register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
+
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+        register_buffer('posterior_variance', posterior_variance)
+        register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min=1e-20)))
+        register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
+
+        snr = alphas_cumprod / (1 - alphas_cumprod)
+        if objective == 'pred_noise':
+            loss_weight = torch.ones_like(snr)
+        elif objective == 'pred_x0':
+            loss_weight = snr
+        elif objective == 'pred_v':
+            loss_weight = snr / (snr + 1)
+        else:
+            raise ValueError(f'unknown objective {objective}')
+        register_buffer('loss_weight', loss_weight)
+
+        self.normalize = normalize_to_neg_one_to_one if auto_normalize else identity
+        self.unnormalize = unnormalize_to_zero_to_one if auto_normalize else identity
+
+    @property
+    def device(self):
+        return self.betas.device
+
+    def build_context(self, sequences, target_indices, target_values):
+        device = sequences.device
+        batch, seq_len = sequences.shape
+        arange = torch.arange(seq_len, device=device)
+        prefix_mask = arange.unsqueeze(0) < target_indices.unsqueeze(1)
+        context = torch.zeros_like(sequences)
+        context = torch.where(prefix_mask, sequences, context)
+        context.scatter_(1, target_indices.unsqueeze(1), target_values.unsqueeze(1))
+        key_padding_mask = arange.unsqueeze(0) > target_indices.unsqueeze(1)
+        return context, key_padding_mask
+
+    def q_sample(self, x_start, t, noise):
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
+
+    def predict_start_from_noise(self, x_t, t, noise):
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    def q_posterior(self, x_start, x_t, t):
+        posterior_mean = (
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+            extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def p_losses(self, sequences, t, target_indices, noise=None):
+        batch = sequences.shape[0]
+        noise = default(noise, lambda: torch.randn(batch, device=self.device))
+        target = sequences[torch.arange(batch, device=self.device), target_indices]
+        noisy_target = self.q_sample(target, t, noise)
+        context, key_padding_mask = self.build_context(sequences, target_indices, noisy_target)
+        pred = self.model(context, target_indices, t, key_padding_mask)
+
+        if self.objective == 'pred_noise':
+            target_value = noise
+        elif self.objective == 'pred_x0':
+            target_value = target
+        elif self.objective == 'pred_v':
+            target_value = self.predict_v(target, t, noise)
+        loss = F.mse_loss(pred, target_value, reduction='none')
+        loss = loss * extract(self.loss_weight, t, loss.shape)
+        return loss.mean()
+
+    def forward(self, sequences, *args, **kwargs):
+        batch, seq_len = sequences.shape
+        assert seq_len == self.seq_len, f'sequence length must be {self.seq_len}'
+        t = torch.randint(0, self.num_timesteps, (batch,), device=sequences.device).long()
+        target_indices = torch.randint(0, self.seq_len, (batch,), device=sequences.device).long()
+        return self.p_losses(sequences, t, target_indices, *args, **kwargs)
+
+    @torch.inference_mode()
+    def sample(
+        self,
+        batch_size=16,
+        save_timesteps=None,
+        return_all_timesteps=False,
+        start_idx=0,
+        end_idx=None,
+        show_progress=False,
+        progress_desc=None,
+    ):
+        if save_timesteps is not None:
+            warnings.warn(
+                "Sequential sampling currently ignores `save_timesteps`; only the fully denoised sequences are returned.",
+                stacklevel=2,
+            )
+        if return_all_timesteps:
+            warnings.warn(
+                "Sequential sampling does not expose intermediate histories; returning only the final sequences.",
+                stacklevel=2,
+            )
+
+        sequences = torch.zeros(batch_size, self.seq_len, device=self.device)
+
+        if end_idx is None:
+            end_idx = self.seq_len
+        start_idx = max(0, int(start_idx))
+        end_idx = min(self.seq_len, int(end_idx))
+        if start_idx >= end_idx:
+            raise ValueError("Sampling window must include at least one index")
+
+        indices_to_generate = list(range(start_idx, end_idx))
+        iterator = indices_to_generate
+        if show_progress:
+            iterator = tqdm(
+                indices_to_generate,
+                desc=progress_desc or "Sampling",
+                unit="index",
+                leave=False,
+            )
+
+        for pos in iterator:
+            x_t = torch.randn(batch_size, device=self.device)
+            target_indices = torch.full((batch_size,), pos, device=self.device, dtype=torch.long)
+            for t in reversed(range(self.num_timesteps)):
+                context, key_padding_mask = self.build_context(sequences, target_indices, x_t)
+                times = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
+                pred_noise = self.model(context, target_indices, times, key_padding_mask)
+                x_start = self.predict_start_from_noise(x_t, times, pred_noise)
+                if t == 0:
+                    x_t = x_start
+                else:
+                    model_mean, _, log_variance = self.q_posterior(x_start, x_t, times)
+                    noise = torch.randn_like(x_t)
+                    x_t = model_mean + (0.5 * log_variance).exp() * noise
+
+            sequences[:, pos] = x_t
+            if show_progress:
+                iterator.set_postfix(index=pos)
+
+        return sequences
+
 class WarmUpCosineAnnealingWarmRestarts:
     def __init__(self, optimizer, warmup_iters=10, T_0=100, T_mult=1, eta_min=1e-6, cosine_steps=200, last_epoch=-1):
         """
@@ -1217,6 +1480,8 @@ class Trainer:
             num_batches = 0
             total_batches = len(self.dataloader)
             update_pbar_batches = total_batches  # // 2
+            grad_norm_total = 0.0
+            grad_norm_count = 0
             # Update scheduler for each epoch
             self.scheduler.step(epoch)
             
@@ -1234,7 +1499,13 @@ class Trainer:
 
                     # Update model parameters after accumulating `gradient_accumulate_every` batches
                     if (batch_idx + 1) % self.gradient_accumulate_every == 0:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        parameters = [p for p in self.model.parameters() if p.grad is not None]
+                        if parameters:
+                            grad_norm = self.accelerator.clip_grad_norm_(parameters, self.max_grad_norm)
+                            grad_norm_total += grad_norm.item()
+                            grad_norm_count += 1
+                        else:
+                            self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.optimizer.zero_grad()
 
@@ -1251,11 +1522,16 @@ class Trainer:
 
                 # Log metrics at the end of the epoch
                 avg_train_loss = total_loss / num_batches
+                avg_grad_norm = grad_norm_total / grad_norm_count if grad_norm_count else 0.0
 
                 self.logger.add_scalar('Train/Average Loss', avg_train_loss, epoch)
+                self.logger.add_scalar('Train/Average Grad Norm', avg_grad_norm, epoch)
                 self.logger.flush()
 
-                self.accelerator.print(f"Epoch {epoch + 1}/{self.train_epochs} completed with avg loss {avg_train_loss:.4f}")
+                self.accelerator.print(
+                    f"Epoch {epoch + 1}/{self.train_epochs} completed with avg loss {avg_train_loss:.4f} "
+                    f"and avg grad norm {avg_grad_norm:.4f}"
+                )
 
                 # Save model and generate samples at the end of each epoch
                 if self.accelerator.is_main_process and (epoch + 1) % self.save_and_sample_every == 0:
