@@ -190,11 +190,13 @@ def train_model(
             show_progress=True,
             progress_desc=progress_desc,
         )
+        mean = data_mean.to(samples.device)
+        std = data_std.to(samples.device)
         if samples.dim() == 3:
             # (batch, snapshots, seq_len)
-            scaled = samples * data_std.unsqueeze(1) + data_mean.unsqueeze(1)
+            scaled = samples * std.unsqueeze(1) + mean.unsqueeze(1)
         else:
-            scaled = samples * data_std + data_mean
+            scaled = samples * std + mean
         samples = scaled.reshape(scaled.size(0), -1).cpu().numpy()
         
         sample_file = os.path.join(sample_dir, f"sample_batch{i+1}.npy")

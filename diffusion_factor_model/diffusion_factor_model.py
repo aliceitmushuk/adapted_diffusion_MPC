@@ -1502,10 +1502,11 @@ class Trainer:
                     if (batch_idx + 1) % self.gradient_accumulate_every == 0:
                         parameters = [p for p in self.model.parameters() if p.grad is not None]
                         if parameters:
-                            grad_norm = torch.norm(torch.stack([p.grad.detach().norm(2) for p in parameters]), 2)
+                            grad_norm = self.accelerator.clip_grad_norm_(parameters, self.max_grad_norm)
                             grad_norm_total += grad_norm.item()
                             grad_norm_count += 1
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        else:
+                            self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.optimizer.zero_grad()
 
