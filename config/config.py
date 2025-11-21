@@ -24,10 +24,17 @@ EXP_PREFIX = "dfm"  # Prefix for experiment IDs
 SEED = 3407
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# Model parameters
+# Model parameters (legacy UNet support)
 MODEL_DIM = 256            # Base dimension for U-Net
 MODEL_CHANNELS = 1        # Number of channels in input data
 MODEL_FILTER_SIZE = 7     # Filter size for convolutions
+
+# Transformer parameters
+TRANSFORMER_DIM = 256
+TRANSFORMER_LAYERS = 8
+TRANSFORMER_HEADS = 8
+TRANSFORMER_FF_MULT = 4
+TRANSFORMER_DROPOUT = 0.1
 
 # Dimension multipliers for different input sizes
 DIM_MULTS_LARGE = (1, 2, 4, 16)     # For inputs where min_dim >= 32
@@ -38,6 +45,8 @@ DIM_MULTS_MINIMAL = (1,)           # For very small inputs
 
 # Diffusion parameters
 TIMESTEPS = 200
+SAMPLING_TIMESTEPS = 50   # Number of steps used for DDIM sampling (set >= TIMESTEPS to disable DDIM)
+DDIM_ETA = 0.0            # Noise weight for DDIM (0.0 makes sampling deterministic)
 OBJECTIVE = 'pred_noise'
 BETA_SCHEDULE = 'cosine'
 AUTO_NORMALIZE = False
@@ -62,9 +71,9 @@ SAVE_INTERVAL = 1000       # Save checkpoint every N epochs
 # Sampling parameters
 SAMPLE_BATCHES = 64       # Number of batches to sample
 SAMPLES_PER_BATCH = 128   # Number of samples per batch
-SAVE_TIMESTEPS = [20]     # Specific timesteps to save for early stopping evaluation (e.g., [100, 200, 500])
-                          # Set to None to save only final denoised samples
-                          # Set to a list like [100, 200, 500] to save samples at those timesteps
+SAVE_TIMESTEPS = None     # For sequential sampling, defaults to final output only
+SAMPLE_WINDOW_START = 0   # Default start index for sequential sampling windows
+SAMPLE_WINDOW_LENGTH = 32 # Number of sequential indices to generate by default (capped by sequence length)
 
 # Mixed precision settings
 USE_AMP = True            # Mixed precision training
