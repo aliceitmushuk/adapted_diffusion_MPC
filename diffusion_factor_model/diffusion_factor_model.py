@@ -1092,6 +1092,291 @@ class GaussianDiffusion(Module):
         img = self.normalize(img)
         return self.p_losses(img, t, *args, **kwargs)
 
+class SequentialGaussianDiffusion(Module):
+    """Sequential diffusion process that denoises entries one-by-one."""
+
+    def __init__(
+        self,
+        model,
+        *,
+        seq_len,
+        timesteps=1000,
+        sampling_timesteps=None,
+        ddim_eta=0.0,
+        objective='pred_noise',
+        beta_schedule='cosine',
+        schedule_fn_kwargs=dict(),
+        auto_normalize=False,
+    ):
+        super().__init__()
+        self.model = model
+        self.seq_len = seq_len
+        self.objective = objective
+
+        if beta_schedule == 'linear':
+            beta_schedule_fn = linear_beta_schedule
+        elif beta_schedule == 'cosine':
+            beta_schedule_fn = cosine_beta_schedule
+        elif beta_schedule == 'sigmoid':
+            beta_schedule_fn = sigmoid_beta_schedule
+        else:
+            raise ValueError(f'unknown beta schedule {beta_schedule}')
+
+        betas = beta_schedule_fn(timesteps, **schedule_fn_kwargs)
+        alphas = 1. - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.)
+
+        self.num_timesteps = int(betas.shape[0])
+
+        register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
+
+        register_buffer('betas', betas)
+        register_buffer('alphas_cumprod', alphas_cumprod)
+        register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+        register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
+        register_buffer('log_one_minus_alphas_cumprod', torch.log(1. - alphas_cumprod))
+        register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
+        register_buffer('sqrt_recipm1_alphas_cumprod', torch.sqrt(1. / alphas_cumprod - 1))
+
+        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
+        register_buffer('posterior_variance', posterior_variance)
+        register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min=1e-20)))
+        register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
+        register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
+
+        snr = alphas_cumprod / (1 - alphas_cumprod)
+        if objective == 'pred_noise':
+            loss_weight = torch.ones_like(snr)
+        elif objective == 'pred_x0':
+            loss_weight = snr
+        elif objective == 'pred_v':
+            loss_weight = snr / (snr + 1)
+        else:
+            raise ValueError(f'unknown objective {objective}')
+        register_buffer('loss_weight', loss_weight)
+
+        self.normalize = normalize_to_neg_one_to_one if auto_normalize else identity
+        self.unnormalize = unnormalize_to_zero_to_one if auto_normalize else identity
+
+        self.sampling_timesteps = self.num_timesteps if sampling_timesteps is None else int(sampling_timesteps)
+        if self.sampling_timesteps <= 0:
+            raise ValueError("sampling_timesteps must be a positive integer")
+        self.is_ddim_sampling = self.sampling_timesteps < self.num_timesteps
+        self.ddim_sampling_eta = float(ddim_eta)
+
+    @property
+    def device(self):
+        return self.betas.device
+
+    def build_context(self, sequences, target_indices, target_values):
+        device = sequences.device
+        batch, seq_len = sequences.shape
+        arange = torch.arange(seq_len, device=device)
+        prefix_mask = arange.unsqueeze(0) < target_indices.unsqueeze(1)
+        context = torch.zeros_like(sequences)
+        context = torch.where(prefix_mask, sequences, context)
+        context.scatter_(1, target_indices.unsqueeze(1), target_values.unsqueeze(1))
+        key_padding_mask = arange.unsqueeze(0) > target_indices.unsqueeze(1)
+        return context, key_padding_mask
+
+    def q_sample(self, x_start, t, noise):
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+        )
+
+    def predict_start_from_noise(self, x_t, t, noise):
+        return (
+            extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    def predict_noise_from_start(self, x_t, t, x0):
+        return (
+            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0)
+            / extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        )
+
+    def predict_start_from_v(self, x_t, t, v):
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
+        )
+
+    def predict_noise_from_v(self, x_t, t, v):
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_t.shape) * v +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * x_t
+        )
+
+    def q_posterior(self, x_start, x_t, t):
+        posterior_mean = (
+            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
+            extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
+        )
+        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def p_losses(self, sequences, t, target_indices, noise=None):
+        batch = sequences.shape[0]
+        noise = default(noise, lambda: torch.randn(batch, device=self.device))
+        target = sequences[torch.arange(batch, device=self.device), target_indices]
+        noisy_target = self.q_sample(target, t, noise)
+        context, key_padding_mask = self.build_context(sequences, target_indices, noisy_target)
+        pred = self.model(context, target_indices, t, key_padding_mask)
+
+        if self.objective == 'pred_noise':
+            target_value = noise
+        elif self.objective == 'pred_x0':
+            target_value = target
+        elif self.objective == 'pred_v':
+            target_value = self.predict_v(target, t, noise)
+        loss = F.mse_loss(pred, target_value, reduction='none')
+        loss = loss * extract(self.loss_weight, t, loss.shape)
+        return loss.mean()
+
+    def forward(self, sequences, *args, **kwargs):
+        batch, seq_len = sequences.shape
+        assert seq_len == self.seq_len, f'sequence length must be {self.seq_len}'
+        t = torch.randint(0, self.num_timesteps, (batch,), device=sequences.device).long()
+        target_indices = torch.randint(0, self.seq_len, (batch,), device=sequences.device).long()
+        return self.p_losses(sequences, t, target_indices, *args, **kwargs)
+
+    def _build_ddim_time_pairs(self):
+        device = self.device
+        times = torch.linspace(0, self.num_timesteps - 1, steps=self.sampling_timesteps, device=device)
+        times = torch.flip(times.long(), dims=[0]).tolist()
+        if len(times) == 1:
+            return [(times[0], -1)]
+        return list(zip(times[:-1], times[1:] + [-1]))
+
+    def _model_predictions(self, context, key_padding_mask, target_indices, x_t, times):
+        """Return predicted noise and x_start for a given timestep.
+
+        Supports objectives of predicting noise, x0, or velocity (v).
+        """
+
+        model_out = self.model(context, target_indices, times, key_padding_mask)
+
+        if self.objective == 'pred_noise':
+            pred_noise = model_out
+            x_start = self.predict_start_from_noise(x_t, times, pred_noise)
+        elif self.objective == 'pred_x0':
+            x_start = model_out
+            pred_noise = self.predict_noise_from_start(x_t, times, x_start)
+        elif self.objective == 'pred_v':
+            x_start = self.predict_start_from_v(x_t, times, model_out)
+            pred_noise = self.predict_noise_from_v(x_t, times, model_out)
+        else:
+            raise ValueError(f'unknown objective {self.objective}')
+
+        return pred_noise, x_start
+
+    def _ddpm_step(self, sequences, pos):
+        batch_size = sequences.size(0)
+        x_t = torch.randn(batch_size, device=self.device)
+        target_indices = torch.full((batch_size,), pos, device=self.device, dtype=torch.long)
+        for t in reversed(range(self.num_timesteps)):
+            times = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
+            context, key_padding_mask = self.build_context(sequences, target_indices, x_t)
+            pred_noise, x_start = self._model_predictions(
+                context,
+                key_padding_mask,
+                target_indices,
+                x_t,
+                times,
+            )
+            if t == 0:
+                x_t = x_start
+            else:
+                model_mean, _, log_variance = self.q_posterior(x_start, x_t, times)
+                noise = torch.randn_like(x_t)
+                x_t = model_mean + (0.5 * log_variance).exp() * noise
+        return x_t
+
+    def _ddim_step(self, sequences, pos):
+        batch_size = sequences.size(0)
+        x_t = torch.randn(batch_size, device=self.device)
+        target_indices = torch.full((batch_size,), pos, device=self.device, dtype=torch.long)
+        time_pairs = self._build_ddim_time_pairs()
+
+        for time, time_next in time_pairs:
+            time_cond = torch.full((batch_size,), time, device=self.device, dtype=torch.long)
+            context, key_padding_mask = self.build_context(sequences, target_indices, x_t)
+            pred_noise, x_start = self._model_predictions(
+                context,
+                key_padding_mask,
+                target_indices,
+                x_t,
+                time_cond,
+            )
+
+            if time_next < 0:
+                x_t = x_start
+                continue
+
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+            sigma = self.ddim_sampling_eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = (1 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(x_t)
+            x_t = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
+
+        return x_t
+
+    @torch.inference_mode()
+    def sample(
+        self,
+        batch_size=16,
+        save_timesteps=None,
+        return_all_timesteps=False,
+        start_idx=0,
+        end_idx=None,
+        show_progress=False,
+        progress_desc=None,
+    ):
+        if save_timesteps is not None:
+            warnings.warn(
+                "Sequential sampling currently ignores `save_timesteps`; only the fully denoised sequences are returned.",
+                stacklevel=2,
+            )
+        if return_all_timesteps:
+            warnings.warn(
+                "Sequential sampling does not expose intermediate histories; returning only the final sequences.",
+                stacklevel=2,
+            )
+
+        sequences = torch.zeros(batch_size, self.seq_len, device=self.device)
+        sample_pos = self._ddim_step if self.is_ddim_sampling else self._ddpm_step
+
+        if end_idx is None:
+            end_idx = self.seq_len
+        start_idx = max(0, int(start_idx))
+        end_idx = min(self.seq_len, int(end_idx))
+        if start_idx >= end_idx:
+            raise ValueError("Sampling window must include at least one index")
+
+        indices_to_generate = list(range(start_idx, end_idx))
+        iterator = indices_to_generate
+        if show_progress:
+            iterator = tqdm(
+                indices_to_generate,
+                desc=progress_desc or "Sampling",
+                unit="index",
+                leave=False,
+            )
+
+        for pos in iterator:
+            sequences[:, pos] = sample_pos(sequences, pos)
+            if show_progress:
+                iterator.set_postfix(index=pos)
+
+        return sequences
+
 class WarmUpCosineAnnealingWarmRestarts:
     def __init__(self, optimizer, warmup_iters=10, T_0=100, T_mult=1, eta_min=1e-6, cosine_steps=200, last_epoch=-1):
         """
