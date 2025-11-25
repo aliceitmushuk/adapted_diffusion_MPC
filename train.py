@@ -144,6 +144,8 @@ def train_model(
         model,
         seq_len=seq_len,
         timesteps=config.TIMESTEPS,
+        sampling_timesteps=config.SAMPLING_TIMESTEPS,
+        ddim_eta=config.DDIM_ETA,
         objective=config.OBJECTIVE,
         beta_schedule=config.BETA_SCHEDULE,
         auto_normalize=config.AUTO_NORMALIZE

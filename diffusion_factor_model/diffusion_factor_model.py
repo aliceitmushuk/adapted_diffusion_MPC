@@ -474,6 +474,7 @@ class ConditionalTransformer(Module):
         self.register_buffer('causal_mask', mask)
         self.dropout = nn.Dropout(dropout)
         # Small prediction head so representation and scalar output can live in different spaces
+        # Empirically, stacking two hidden layers stabilizes gradients, so keep both.
         self.output = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, dim),
@@ -1100,6 +1101,8 @@ class SequentialGaussianDiffusion(Module):
         *,
         seq_len,
         timesteps=1000,
+        sampling_timesteps=None,
+        ddim_eta=0.0,
         objective='pred_noise',
         beta_schedule='cosine',
         schedule_fn_kwargs=dict(),
@@ -1157,6 +1160,12 @@ class SequentialGaussianDiffusion(Module):
         self.normalize = normalize_to_neg_one_to_one if auto_normalize else identity
         self.unnormalize = unnormalize_to_zero_to_one if auto_normalize else identity
 
+        self.sampling_timesteps = self.num_timesteps if sampling_timesteps is None else int(sampling_timesteps)
+        if self.sampling_timesteps <= 0:
+            raise ValueError("sampling_timesteps must be a positive integer")
+        self.is_ddim_sampling = self.sampling_timesteps < self.num_timesteps
+        self.ddim_sampling_eta = float(ddim_eta)
+
     @property
     def device(self):
         return self.betas.device
@@ -1182,6 +1191,24 @@ class SequentialGaussianDiffusion(Module):
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
             extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
+        )
+
+    def predict_noise_from_start(self, x_t, t, x0):
+        return (
+            (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0)
+            / extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
+        )
+
+    def predict_start_from_v(self, x_t, t, v):
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_t.shape) * x_t -
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * v
+        )
+
+    def predict_noise_from_v(self, x_t, t, v):
+        return (
+            extract(self.sqrt_alphas_cumprod, t, x_t.shape) * v +
+            extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * x_t
         )
 
     def q_posterior(self, x_start, x_t, t):
@@ -1218,6 +1245,74 @@ class SequentialGaussianDiffusion(Module):
         target_indices = torch.randint(0, self.seq_len, (batch,), device=sequences.device).long()
         return self.p_losses(sequences, t, target_indices, *args, **kwargs)
 
+    def _build_ddim_time_pairs(self):
+        device = self.device
+        times = torch.linspace(0, self.num_timesteps - 1, steps=self.sampling_timesteps, device=device)
+        times = torch.flip(times.long(), dims=[0]).tolist()
+        if len(times) == 1:
+            return [(times[0], -1)]
+        return list(zip(times[:-1], times[1:] + [-1]))
+
+    def _model_predictions(self, context, key_padding_mask, target_indices, x_t, times):
+        model_out = self.model(context, target_indices, times, key_padding_mask)
+
+        if self.objective == 'pred_noise':
+            pred_noise = model_out
+            x_start = self.predict_start_from_noise(x_t, times, pred_noise)
+        elif self.objective == 'pred_x0':
+            x_start = model_out
+            pred_noise = self.predict_noise_from_start(x_t, times, x_start)
+        elif self.objective == 'pred_v':
+            x_start = self.predict_start_from_v(x_t, times, model_out)
+            pred_noise = self.predict_noise_from_v(x_t, times, model_out)
+        else:
+            raise ValueError(f'unknown objective {self.objective}')
+
+        return pred_noise, x_start
+
+    def _ddpm_step(self, sequences, pos):
+        batch_size = sequences.size(0)
+        x_t = torch.randn(batch_size, device=self.device)
+        target_indices = torch.full((batch_size,), pos, device=self.device, dtype=torch.long)
+        for t in reversed(range(self.num_timesteps)):
+            times = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
+            context, key_padding_mask = self.build_context(sequences, target_indices, x_t)
+            pred_noise = self.model(context, target_indices, times, key_padding_mask)
+            x_start = self.predict_start_from_noise(x_t, times, pred_noise)
+            if t == 0:
+                x_t = x_start
+            else:
+                model_mean, _, log_variance = self.q_posterior(x_start, x_t, times)
+                noise = torch.randn_like(x_t)
+                x_t = model_mean + (0.5 * log_variance).exp() * noise
+        return x_t
+
+    def _ddim_step(self, sequences, pos):
+        batch_size = sequences.size(0)
+        x_t = torch.randn(batch_size, device=self.device)
+        target_indices = torch.full((batch_size,), pos, device=self.device, dtype=torch.long)
+        time_pairs = self._build_ddim_time_pairs()
+
+        for time, time_next in time_pairs:
+            time_cond = torch.full((batch_size,), time, device=self.device, dtype=torch.long)
+            context, key_padding_mask = self.build_context(sequences, target_indices, x_t)
+            pred_noise = self.model(context, target_indices, time_cond, key_padding_mask)
+            x_start = self.predict_start_from_noise(x_t, time_cond, pred_noise)
+
+            if time_next < 0:
+                x_t = x_start
+                continue
+
+            alpha = self.alphas_cumprod[time]
+            alpha_next = self.alphas_cumprod[time_next]
+            sigma = self.ddim_sampling_eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = (1 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(x_t)
+            x_t = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
+
+        return x_t
+
     @torch.inference_mode()
     def sample(
         self,
@@ -1241,6 +1336,7 @@ class SequentialGaussianDiffusion(Module):
             )
 
         sequences = torch.zeros(batch_size, self.seq_len, device=self.device)
+        sample_pos = self._ddim_step if self.is_ddim_sampling else self._ddpm_step
 
         if end_idx is None:
             end_idx = self.seq_len
@@ -1260,21 +1356,7 @@ class SequentialGaussianDiffusion(Module):
             )
 
         for pos in iterator:
-            x_t = torch.randn(batch_size, device=self.device)
-            target_indices = torch.full((batch_size,), pos, device=self.device, dtype=torch.long)
-            for t in reversed(range(self.num_timesteps)):
-                context, key_padding_mask = self.build_context(sequences, target_indices, x_t)
-                times = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
-                pred_noise = self.model(context, target_indices, times, key_padding_mask)
-                x_start = self.predict_start_from_noise(x_t, times, pred_noise)
-                if t == 0:
-                    x_t = x_start
-                else:
-                    model_mean, _, log_variance = self.q_posterior(x_start, x_t, times)
-                    noise = torch.randn_like(x_t)
-                    x_t = model_mean + (0.5 * log_variance).exp() * noise
-
-            sequences[:, pos] = x_t
+            sequences[:, pos] = sample_pos(sequences, pos)
             if show_progress:
                 iterator.set_postfix(index=pos)
 

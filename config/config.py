@@ -45,6 +45,8 @@ DIM_MULTS_MINIMAL = (1,)           # For very small inputs
 
 # Diffusion parameters
 TIMESTEPS = 200
+SAMPLING_TIMESTEPS = 50   # Number of steps used for DDIM sampling (set >= TIMESTEPS to disable DDIM)
+DDIM_ETA = 0.0            # Noise weight for DDIM (0.0 makes sampling deterministic)
 OBJECTIVE = 'pred_noise'
 BETA_SCHEDULE = 'cosine'
 AUTO_NORMALIZE = False
