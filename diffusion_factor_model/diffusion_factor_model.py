@@ -478,6 +478,8 @@ class ConditionalTransformer(Module):
             nn.LayerNorm(dim),
             nn.Linear(dim, dim),
             nn.SiLU(),
+            nn.Linear(dim, dim),
+            nn.SiLU(),
             nn.Linear(dim, 1)
         )
 

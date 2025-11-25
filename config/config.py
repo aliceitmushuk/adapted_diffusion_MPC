@@ -33,7 +33,7 @@ MODEL_FILTER_SIZE = 7     # Filter size for convolutions
 TRANSFORMER_DIM = 256
 TRANSFORMER_LAYERS = 8
 TRANSFORMER_HEADS = 8
-TRANSFORMER_FF_MULT = 4
+TRANSFORMER_FF_MULT = 2
 TRANSFORMER_DROPOUT = 0.1
 
 # Dimension multipliers for different input sizes
@@ -50,9 +50,9 @@ BETA_SCHEDULE = 'cosine'
 AUTO_NORMALIZE = False
 
 # Training parameters
-BATCH_SIZE = 32
-LEARNING_RATE = 1e-4
-EPOCHS = 600
+BATCH_SIZE = 512
+LEARNING_RATE = 3e-4
+EPOCHS = 1000
 WEIGHT_DECAY = 0.01
 USE_COSINE_SCHEDULER = True
 USE_WARM_UP = True
@@ -64,7 +64,7 @@ COSINE_LR_MIN = 1e-05      # ETA_MIN
 GRADIENT_ACCUMULATION = 1
 EMA_DECAY = 0.999
 SPLIT_BATCHES = False
-SAVE_INTERVAL = 1000       # Save checkpoint every N epochs
+SAVE_INTERVAL = 100       # Save checkpoint every N epochs
 
 # Sampling parameters
 SAMPLE_BATCHES = 64       # Number of batches to sample
