@@ -1314,6 +1314,11 @@ class SequentialGaussianDiffusion(Module):
                 time_cond,
             )
 
+            # For DDIM, base the update on the reconstructed clean signal so the
+            # denoising trajectory follows the learned data manifold even when the
+            # training objective predicts noise.
+            pred_noise = self.predict_noise_from_start(x_t, time_cond, x_start)
+
             if time_next < 0:
                 x_t = x_start
                 continue
