@@ -1580,6 +1580,7 @@ class Trainer:
             total_batches = len(self.dataloader)
             update_pbar_batches = total_batches  # // 2
             grad_norm_total = 0.0
+            grad_norm_clipped_total = 0.0
             grad_norm_count = 0
             # Update scheduler for each epoch
             self.scheduler.step(epoch)
@@ -1602,6 +1603,7 @@ class Trainer:
                         if parameters:
                             grad_norm = self.accelerator.clip_grad_norm_(parameters, self.max_grad_norm)
                             grad_norm_total += grad_norm.item()
+                            grad_norm_clipped_total += min(grad_norm.item(), self.max_grad_norm)
                             grad_norm_count += 1
                         else:
                             self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -1622,14 +1624,18 @@ class Trainer:
                 # Log metrics at the end of the epoch
                 avg_train_loss = total_loss / num_batches
                 avg_grad_norm = grad_norm_total / grad_norm_count if grad_norm_count else 0.0
+                avg_grad_norm_clipped = (
+                    grad_norm_clipped_total / grad_norm_count if grad_norm_count else 0.0
+                )
 
                 self.logger.add_scalar('Train/Average Loss', avg_train_loss, epoch)
                 self.logger.add_scalar('Train/Average Grad Norm', avg_grad_norm, epoch)
+                self.logger.add_scalar('Train/Average Clipped Grad Norm', avg_grad_norm_clipped, epoch)
                 self.logger.flush()
 
                 self.accelerator.print(
                     f"Epoch {epoch + 1}/{self.train_epochs} completed with avg loss {avg_train_loss:.4f} "
-                    f"and avg grad norm {avg_grad_norm:.4f}"
+                    f"and avg grad norm {avg_grad_norm:.4f} (clipped {avg_grad_norm_clipped:.4f})"
                 )
 
                 # Save model and generate samples at the end of each epoch
