@@ -26,6 +26,8 @@ def train_model(
     save_timesteps=None,
     sample_window_start=None,
     sample_window_length=None,
+    checkpoint_path=None,
+    skip_training=False,
 ):
     """
     Train the diffusion model using a specific data file
@@ -40,6 +42,8 @@ def train_model(
                        (None = use config.SAVE_TIMESTEPS, which defaults to None meaning save only final result)
         sample_window_start: Optional start index (inclusive) for sequential sampling
         sample_window_length: Optional number of sequential entries to generate
+        checkpoint_path: Optional path to a saved checkpoint to load before training/sampling
+        skip_training: If True, load the checkpoint (if provided) and skip training to only run sampling
     """
     # Set GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -177,12 +181,26 @@ def train_model(
         amp=config.USE_AMP,
         save_timesteps=save_timesteps,  # Pass save_timesteps for early stopping evaluation
     )
-    
+
     print("Trainer initialized")
-    
-    # Train model
-    print(f"Starting training for {epochs} epochs...")
-    trainer.train()
+
+    if checkpoint_path:
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found at {checkpoint_path}")
+        print(f"Loading checkpoint from {checkpoint_path}")
+        trainer.load(checkpoint_path)
+        print("Checkpoint loaded")
+    elif skip_training:
+        raise ValueError("--skip_training requires a valid --checkpoint_path to load weights")
+
+    # Train model unless explicitly skipped
+    if skip_training:
+        print("Skipping training and proceeding directly to sampling")
+        diffusion.eval()
+    else:
+        print(f"Starting training for {epochs} epochs...")
+        trainer.train()
+        diffusion.eval()
     
     # Generate samples
     print("Generating samples...")
@@ -246,6 +264,10 @@ if __name__ == "__main__":
                       help="Start index (inclusive) for sequential sampling window")
     parser.add_argument("--sample_window_length", type=int, default=None,
                       help="Number of indices to generate in the sampling window")
+    parser.add_argument("--checkpoint_path", type=str, default=None,
+                      help="Path to a checkpoint file to load before training/sampling")
+    parser.add_argument("--skip_training", action="store_true",
+                      help="Skip training and only run sampling (requires --checkpoint_path for pretrained weights)")
     
     args = parser.parse_args()
     
@@ -258,4 +280,6 @@ if __name__ == "__main__":
         args.save_timesteps,
         args.sample_window_start,
         args.sample_window_length,
+        args.checkpoint_path,
+        args.skip_training,
     )
