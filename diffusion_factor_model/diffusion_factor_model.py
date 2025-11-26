@@ -1269,7 +1269,7 @@ class SequentialGaussianDiffusion(Module):
             pred_noise = self.predict_noise_from_start(x_t, times, x_start)
         elif self.objective == 'pred_v':
             x_start = self.predict_start_from_v(x_t, times, model_out)
-            pred_noise = self.predict_noise_from_v(x_t, times, model_out)
+            pred_noise = self.predict_noise_from_start(x_t, times, x_start)
         else:
             raise ValueError(f'unknown objective {self.objective}')
 
