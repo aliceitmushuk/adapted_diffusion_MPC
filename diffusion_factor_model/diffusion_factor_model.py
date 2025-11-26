@@ -1177,14 +1177,26 @@ class SequentialGaussianDiffusion(Module):
         return self.betas.device
 
     def build_context(self, sequences, target_indices, target_values):
+        """Build causal context so predictions condition only on history.
+
+        This masks out future indices and slots the noisy target value at the
+        desired position, ensuring both training and sampling see the same
+        autoregressive conditioning signal.
+        """
+
         device = sequences.device
-        batch, seq_len = sequences.shape
-        arange = torch.arange(seq_len, device=device)
-        prefix_mask = arange.unsqueeze(0) < target_indices.unsqueeze(1)
-        context = torch.zeros_like(sequences)
-        context = torch.where(prefix_mask, sequences, context)
+        _, seq_len = sequences.shape
+        positions = torch.arange(seq_len, device=device).unsqueeze(0)
+
+        # Only keep tokens strictly before the target index
+        prefix_mask = positions < target_indices.unsqueeze(1)
+        context = torch.where(prefix_mask, sequences, torch.zeros_like(sequences))
+
+        # Insert the noisy (or current) target value at its index
         context.scatter_(1, target_indices.unsqueeze(1), target_values.unsqueeze(1))
-        key_padding_mask = arange.unsqueeze(0) > target_indices.unsqueeze(1)
+
+        # Mask everything after the target so the transformer cannot peek ahead
+        key_padding_mask = positions > target_indices.unsqueeze(1)
         return context, key_padding_mask
 
     def q_sample(self, x_start, t, noise):
