@@ -9,6 +9,7 @@ import os
 import gc
 import argparse
 import time
+import subprocess
 
 from diffusion_factor_model.diffusion_factor_model import (
     ConditionalTransformer,
@@ -47,6 +48,19 @@ def train_model(
     """
     # Set GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    def get_git_commit_hash():
+        try:
+            repo_root = os.path.dirname(os.path.abspath(__file__))
+            return (
+                subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=repo_root, stderr=subprocess.DEVNULL
+                )
+                .decode()
+                .strip()
+            )
+        except Exception:
+            return "unknown"
     
     # Use config default if save_timesteps not specified
     if save_timesteps is None:
@@ -62,6 +76,9 @@ def train_model(
     
     # Create experiment ID
     exp_id = f"{config.EXP_PREFIX}_{data_id}_ts{timestamp}_seed{seed}"
+
+    commit_hash = get_git_commit_hash()
+    print(f"Git commit hash: {commit_hash}")
     
     # Load data to determine shape and dimensions
     data_np = np.load(data_path)
@@ -119,6 +136,14 @@ def train_model(
     sample_dir = os.path.join(config.SAMPLES_DIR, exp_id)
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(sample_dir, exist_ok=True)
+
+    # Save commit hash for reproducibility
+    hash_record = os.path.join(model_dir, "commit_hash.txt")
+    try:
+        with open(hash_record, "w") as f:
+            f.write(commit_hash + "\n")
+    except OSError:
+        print(f"Warning: unable to write commit hash to {hash_record}")
 
     # Create dataset
     data_mean = data.mean(dim=0, keepdim=True)
