@@ -10,6 +10,7 @@ import gc
 import argparse
 import time
 import subprocess
+import json
 
 from diffusion_factor_model.diffusion_factor_model import (
     ConditionalTransformer,
@@ -29,6 +30,7 @@ def train_model(
     sample_window_length=None,
     checkpoint_path=None,
     skip_training=False,
+    cli_args=None,
 ):
     """
     Train the diffusion model using a specific data file
@@ -45,6 +47,7 @@ def train_model(
         sample_window_length: Optional number of sequential entries to generate
         checkpoint_path: Optional path to a saved checkpoint to load before training/sampling
         skip_training: If True, load the checkpoint (if provided) and skip training to only run sampling
+        cli_args: Optional dictionary of CLI arguments for logging
     """
     # Set GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -144,6 +147,21 @@ def train_model(
             f.write(commit_hash + "\n")
     except OSError:
         print(f"Warning: unable to write commit hash to {hash_record}")
+
+    # Persist CLI arguments and config snapshot for reproducibility
+    run_record = os.path.join(model_dir, "run_config.json")
+    config_snapshot = {k: getattr(config, k) for k in dir(config) if k.isupper()}
+    metadata = {
+        "commit_hash": commit_hash,
+        "cli_args": cli_args if cli_args is not None else {},
+        "config": config_snapshot,
+    }
+    try:
+        with open(run_record, "w") as f:
+            json.dump(metadata, f, indent=2, default=str)
+        print(f"Saved run configuration to {run_record}")
+    except OSError:
+        print(f"Warning: unable to write run configuration to {run_record}")
 
     # Create dataset
     data_mean = data.mean(dim=0, keepdim=True)
@@ -293,9 +311,9 @@ if __name__ == "__main__":
                       help="Path to a checkpoint file to load before training/sampling")
     parser.add_argument("--skip_training", action="store_true",
                       help="Skip training and only run sampling (requires --checkpoint_path for pretrained weights)")
-    
+
     args = parser.parse_args()
-    
+
     train_model(
         args.data_path,
         args.seed,
@@ -307,4 +325,5 @@ if __name__ == "__main__":
         args.sample_window_length,
         args.checkpoint_path,
         args.skip_training,
+        cli_args=vars(args),
     )
