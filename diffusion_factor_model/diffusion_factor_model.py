@@ -1605,21 +1605,19 @@ class Trainer:
             total_loss = 0.0
             num_batches = 0
             total_batches = len(self.dataloader)
-            update_pbar_batches = total_batches  # // 2
             grad_norm_total = 0.0
             grad_norm_clipped_total = 0.0
             grad_norm_count = 0
-            # Update scheduler for each epoch
-            self.scheduler.step(epoch)
-            
+
             with tqdm(total=len(self.dataloader), desc=f"Epoch {epoch+1}/{self.train_epochs}", disable=not self.accelerator.is_main_process) as pbar:
                 for batch_idx, data in enumerate(self.dataloader):
-                    data = data[0].to(device)
+                    data = data[0].to(self.accelerator.device)
 
                     # Forward pass with gradient accumulation
                     with self.accelerator.autocast():
-                        batch_loss = self.model(data) / self.gradient_accumulate_every
-                        total_loss += batch_loss.item()
+                        loss = self.model(data)
+                        batch_loss = loss / self.gradient_accumulate_every
+                        total_loss += loss.item()
 
                     self.accelerator.backward(batch_loss)
                     num_batches += 1
@@ -1632,21 +1630,21 @@ class Trainer:
                             grad_norm_total += grad_norm.item()
                             grad_norm_clipped_total += min(grad_norm.item(), self.max_grad_norm)
                             grad_norm_count += 1
-                        else:
-                            self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.optimizer.zero_grad()
+                        if self.scheduler is not None:
+                            self.scheduler.step()
 
                         # Update EMA if required
                         if self.accelerator.is_main_process and self.ema and (self.step + 1) % self.ema.update_every == 0:
                             self.ema.update()
 
-                    self.step += 1
+                        self.step += 1
 
-                    # Update progress bar and display loss only when update_pbar_batches is reached
-                    if (batch_idx + 1) % update_pbar_batches == 0:
+                    # Update progress bar each batch with periodic loss refresh
+                    pbar.update(1)
+                    if (batch_idx + 1) % 10 == 0:
                         pbar.set_postfix(loss=total_loss / num_batches)
-                        pbar.update(update_pbar_batches)
 
                 # Log metrics at the end of the epoch
                 avg_train_loss = total_loss / num_batches
