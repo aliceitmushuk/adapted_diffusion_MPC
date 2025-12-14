@@ -1473,6 +1473,7 @@ class Trainer:
         adamw_weight_decay=0.01,
         cosine_scheduler=True,
         warm_up=True,
+        cosine_restarts=False,
         warmup_iters=10,
         T_0=40,
         T_mult=1,
@@ -1515,27 +1516,47 @@ class Trainer:
             self.optimizer = AdamW(diffusion_model.parameters(), lr=train_lr, betas=(0.9, 0.99), weight_decay=adamw_weight_decay)
         else:
             self.optimizer = optimizer
-        
+
+        steps_per_epoch = max(len(dataset) // train_batch_size, 1)
+        updates_per_epoch = max(steps_per_epoch // gradient_accumulate_every, 1)
+        self.total_updates = max(updates_per_epoch * train_epochs, 1)
+
         # Create scheduler if not provided
         if scheduler is None:
             if cosine_scheduler and warm_up:
-                # Use warm-up + cosine annealing with restarts
-                # If cosine_steps not provided, use T_0 as fallback
-                if cosine_steps is None:
-                    cosine_steps = T_0
-                self.scheduler = WarmUpCosineAnnealingWarmRestarts(
-                    self.optimizer, 
-                    warmup_iters=warmup_iters,
-                    T_0=T_0,
-                    T_mult=T_mult,
-                    eta_min=eta_min,
-                    cosine_steps=cosine_steps
-                )
+                if cosine_restarts:
+                    # Use warm-up + cosine annealing with restarts
+                    # If cosine_steps not provided, use T_0 as fallback
+                    if cosine_steps is None:
+                        cosine_steps = T_0
+                    self.scheduler = WarmUpCosineAnnealingWarmRestarts(
+                        self.optimizer,
+                        warmup_iters=warmup_iters,
+                        T_0=T_0,
+                        T_mult=T_mult,
+                        eta_min=eta_min,
+                        cosine_steps=cosine_steps
+                    )
+                else:
+                    warmup_total = min(warmup_iters, self.total_updates)
+                    cosine_total = cosine_steps if cosine_steps is not None else max(self.total_updates - warmup_total, 1)
+                    base_lr = max(self.optimizer.param_groups[0]["lr"], 1e-12)
+                    min_lr_ratio = eta_min / base_lr if base_lr > 0 else 0.0
+
+                    def lr_lambda(step):
+                        if step < warmup_total:
+                            return float(step + 1) / float(max(1, warmup_total))
+                        progress = min(step - warmup_total, cosine_total)
+                        cosine = 0.5 * (1 + math.cos(math.pi * progress / max(1, cosine_total)))
+                        return min_lr_ratio + (1 - min_lr_ratio) * cosine
+
+                    self.scheduler = LambdaLR(self.optimizer, lr_lambda=lr_lambda)
             elif cosine_scheduler:
                 # Use cosine annealing without warm-up
+                t_max = cosine_steps if cosine_steps is not None else self.total_updates
                 self.scheduler = CosineAnnealingLR(
                     self.optimizer,
-                    T_max=T_0,
+                    T_max=max(1, t_max),
                     eta_min=eta_min
                 )
             else:

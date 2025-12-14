@@ -272,6 +272,7 @@ def train_model(
         adamw_weight_decay=config.WEIGHT_DECAY,
         cosine_scheduler=config.USE_COSINE_SCHEDULER,
         warm_up=config.USE_WARM_UP,
+        cosine_restarts=config.USE_COSINE_RESTARTS,
         warmup_iters=config.WARMUP_STEPS,
         T_0=config.COSINE_CYCLE_LENGTH,
         T_mult=config.T_MULT,
