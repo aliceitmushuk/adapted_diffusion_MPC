@@ -49,18 +49,58 @@ def train_model(
     # Set GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-    def get_git_commit_hash():
+    def get_git_metadata():
+        """Return commit hash plus dirty state and optional status/diff snapshots."""
+
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
         try:
-            repo_root = os.path.dirname(os.path.abspath(__file__))
-            return (
+            repo_root = (
+                subprocess.check_output(
+                    ["git", "rev-parse", "--show-toplevel"],
+                    cwd=repo_dir,
+                    stderr=subprocess.DEVNULL,
+                )
+                .decode()
+                .strip()
+            )
+            commit = (
                 subprocess.check_output(
                     ["git", "rev-parse", "HEAD"], cwd=repo_root, stderr=subprocess.DEVNULL
                 )
                 .decode()
                 .strip()
             )
+            status = (
+                subprocess.check_output(
+                    ["git", "status", "--porcelain"],
+                    cwd=repo_root,
+                    stderr=subprocess.DEVNULL,
+                )
+                .decode()
+            )
+            dirty = status.strip() != ""
+            try:
+                diff = (
+                    subprocess.check_output(
+                        ["git", "diff"], cwd=repo_root, stderr=subprocess.DEVNULL
+                    )
+                    .decode()
+                )
+            except Exception:
+                diff = None
+            return {
+                "commit": commit,
+                "dirty": dirty,
+                "status": status,
+                "diff": diff,
+            }
         except Exception:
-            return "unknown"
+            return {
+                "commit": "unknown",
+                "dirty": False,
+                "status": None,
+                "diff": None,
+            }
     
     # Use config default if save_timesteps not specified
     if save_timesteps is None:
@@ -77,8 +117,12 @@ def train_model(
     # Create experiment ID
     exp_id = f"{config.EXP_PREFIX}_{data_id}_ts{timestamp}_seed{seed}"
 
-    commit_hash = get_git_commit_hash()
-    print(f"Git commit hash: {commit_hash}")
+    git_info = get_git_metadata()
+    commit_hash = git_info["commit"]
+    commit_label = commit_hash + (" (dirty)" if git_info["dirty"] else "")
+    print(f"Git commit hash: {commit_label}")
+    if git_info["dirty"]:
+        print("Working tree has uncommitted changes; storing status and diff with the run.")
     
     # Load data to determine shape and dimensions
     data_np = np.load(data_path)
@@ -141,9 +185,42 @@ def train_model(
     hash_record = os.path.join(model_dir, "commit_hash.txt")
     try:
         with open(hash_record, "w") as f:
-            f.write(commit_hash + "\n")
+            f.write(commit_label + "\n")
     except OSError:
         print(f"Warning: unable to write commit hash to {hash_record}")
+
+    if git_info["dirty"]:
+        status_record = os.path.join(model_dir, "git_status.txt")
+        diff_record = os.path.join(model_dir, "git_diff.patch")
+        try:
+            with open(status_record, "w") as f:
+                f.write(git_info["status"])
+            print(f"Saved git status to {status_record}")
+        except OSError:
+            print(f"Warning: unable to write git status to {status_record}")
+        if git_info["diff"] is not None:
+            try:
+                with open(diff_record, "w") as f:
+                    f.write(git_info["diff"])
+                print(f"Saved git diff to {diff_record}")
+            except OSError:
+                print(f"Warning: unable to write git diff to {diff_record}")
+
+    # Persist CLI arguments and config snapshot for reproducibility
+    run_record = os.path.join(model_dir, "run_config.json")
+    config_snapshot = {k: getattr(config, k) for k in dir(config) if k.isupper()}
+    metadata = {
+        "commit_hash": commit_hash,
+        "commit_dirty": git_info["dirty"],
+        "cli_args": cli_args if cli_args is not None else {},
+        "config": config_snapshot,
+    }
+    try:
+        with open(run_record, "w") as f:
+            json.dump(metadata, f, indent=2, default=str)
+        print(f"Saved run configuration to {run_record}")
+    except OSError:
+        print(f"Warning: unable to write run configuration to {run_record}")
 
     # Create dataset
     data_mean = data.mean(dim=0, keepdim=True)
