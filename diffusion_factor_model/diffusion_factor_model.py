@@ -447,9 +447,11 @@ class ConditionalTransformer(Module):
         heads=8,
         ff_mult=4,
         dropout=0.1,
+        use_bos_token=False,
     ):
         super().__init__()
         self.seq_len = seq_len
+        self.use_bos_token = use_bos_token
         self.value_proj = nn.Linear(1, dim)
         self.indicator_embed = nn.Embedding(2, dim)
         self.time_mlp = nn.Sequential(
@@ -458,7 +460,10 @@ class ConditionalTransformer(Module):
             nn.SiLU(),
             nn.Linear(dim, dim)
         )
-        self.pos_emb = nn.Parameter(torch.randn(seq_len, dim))
+        emb_len = seq_len + (1 if use_bos_token else 0)
+        self.pos_emb = nn.Parameter(torch.randn(emb_len, dim))
+        if use_bos_token:
+            self.bos_token = nn.Parameter(torch.randn(1, 1, dim))
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=dim,
             nhead=heads,
@@ -469,7 +474,7 @@ class ConditionalTransformer(Module):
             norm_first=True
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, depth)
-        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1)
+        mask = torch.triu(torch.ones(emb_len, emb_len), diagonal=1)
         mask = mask.masked_fill(mask == 1, float('-inf'))
         self.register_buffer('causal_mask', mask)
         self.dropout = nn.Dropout(dropout)
@@ -498,17 +503,25 @@ class ConditionalTransformer(Module):
         batch, seq_len = values.shape
         device = values.device
         tokens = self.value_proj(values.unsqueeze(-1))
-        pos = self.pos_emb[:seq_len].unsqueeze(0)
+        offset = 1 if self.use_bos_token else 0
+        if self.use_bos_token:
+            bos = self.bos_token.expand(batch, -1, -1)
+            tokens = torch.cat([bos, tokens], dim=1)
+
+        seq_len_tokens = tokens.shape[1]
+        pos = self.pos_emb[:seq_len_tokens].unsqueeze(0)
         tokens = tokens + pos
-        indicator = torch.zeros(batch, seq_len, dtype=torch.long, device=device)
-        indicator.scatter_(1, target_indices.unsqueeze(1), 1)
+        indicator = torch.zeros(batch, seq_len_tokens, dtype=torch.long, device=device)
+        indicator.scatter_(1, (target_indices + offset).unsqueeze(1), 1)
         tokens = tokens + self.indicator_embed(indicator)
         time_emb = self.time_mlp(timesteps.float())
-        tokens[torch.arange(batch, device=device), target_indices] += time_emb
+        tokens[torch.arange(batch, device=device), target_indices + offset] += time_emb
         tokens = self.dropout(tokens)
-        mask = self.causal_mask[:seq_len, :seq_len]
+        mask = self.causal_mask[:seq_len_tokens, :seq_len_tokens]
+        if self.use_bos_token:
+            key_padding_mask = F.pad(key_padding_mask, (1, 0), value=False)
         encoded = self.encoder(tokens, mask=mask, src_key_padding_mask=key_padding_mask)
-        target_states = encoded[torch.arange(batch, device=device), target_indices]
+        target_states = encoded[torch.arange(batch, device=device), target_indices + offset]
         return self.output(target_states).squeeze(-1)
 
 # gaussian diffusion trainer class

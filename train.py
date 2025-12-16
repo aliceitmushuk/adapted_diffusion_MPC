@@ -244,6 +244,7 @@ def train_model(
         heads=config.TRANSFORMER_HEADS,
         ff_mult=config.TRANSFORMER_FF_MULT,
         dropout=config.TRANSFORMER_DROPOUT,
+        use_bos_token=config.USE_BOS_TOKEN,
     )
 
     print("Model initialized")

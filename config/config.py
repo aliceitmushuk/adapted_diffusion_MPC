@@ -35,6 +35,7 @@ TRANSFORMER_LAYERS = 8
 TRANSFORMER_HEADS = 8
 TRANSFORMER_FF_MULT = 4
 TRANSFORMER_DROPOUT = 0.1
+USE_BOS_TOKEN = True
 
 # Dimension multipliers for different input sizes
 DIM_MULTS_LARGE = (1, 2, 4, 16)     # For inputs where min_dim >= 32
