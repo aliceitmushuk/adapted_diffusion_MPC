@@ -10,6 +10,7 @@ import gc
 import argparse
 import time
 import subprocess
+import json
 
 from diffusion_factor_model.diffusion_factor_model import (
     ConditionalTransformer,
@@ -29,6 +30,7 @@ def train_model(
     sample_window_length=None,
     checkpoint_path=None,
     skip_training=False,
+    cli_args=None,
 ):
     """
     Train the diffusion model using a specific data file
@@ -48,6 +50,9 @@ def train_model(
     """
     # Set GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    if cli_args is None:
+        cli_args = {}
 
     def get_git_metadata():
         """Return commit hash plus dirty state and optional status/diff snapshots."""
