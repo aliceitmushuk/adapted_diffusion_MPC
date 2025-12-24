@@ -52,6 +52,9 @@ def train_model(
     # Set GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
+    if cli_args is None:
+        cli_args = {}
+
     def get_git_metadata():
         """Return commit hash plus dirty state and optional status/diff snapshots."""
 
