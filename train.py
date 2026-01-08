@@ -28,6 +28,8 @@ def train_model(
     save_timesteps=None,
     sample_window_start=None,
     sample_window_length=None,
+    conditioning_path=None,
+    conditioning_length=None,
     checkpoint_path=None,
     skip_training=False,
     cli_args=None,
@@ -45,6 +47,8 @@ def train_model(
                        (None = use config.SAVE_TIMESTEPS, which defaults to None meaning save only final result)
         sample_window_start: Optional start index (inclusive) for sequential sampling
         sample_window_length: Optional number of sequential entries to generate
+        conditioning_path: Optional path to a conditioning sequence file for sampling
+        conditioning_length: Optional number of prefix entries to condition on during sampling
         checkpoint_path: Optional path to a saved checkpoint to load before training/sampling
         skip_training: If True, load the checkpoint (if provided) and skip training to only run sampling
     """
@@ -234,6 +238,28 @@ def train_model(
     normalized_data = (data - data_mean) / data_std
     dataset = TensorDataset(normalized_data)
 
+    conditioning_source = None
+    if conditioning_path is not None:
+        conditioning_np = np.load(conditioning_path)
+        if conditioning_np.ndim == 1:
+            conditioning_np = conditioning_np.reshape(1, -1)
+        elif conditioning_np.ndim > 2:
+            conditioning_np = conditioning_np.reshape(conditioning_np.shape[0], -1)
+        conditioning = torch.from_numpy(conditioning_np).float()
+        if conditioning.shape[1] != total_seq_len:
+            raise ValueError(
+                f"Conditioning sequence length {conditioning.shape[1]} "
+                f"does not match data length {total_seq_len}"
+            )
+        conditioning = conditioning[:, window_start:window_end]
+        conditioning_source = (conditioning - data_mean) / data_std
+
+    if conditioning_length is None:
+        conditioning_length = seq_len if conditioning_source is not None else 0
+    conditioning_length = int(conditioning_length)
+    if conditioning_length < 0 or conditioning_length > seq_len:
+        raise ValueError("conditioning_length must be between 0 and the sequence length")
+
     # Use epochs from argument or config
     if epochs is None:
         epochs = config.EPOCHS
@@ -320,6 +346,23 @@ def train_model(
     config.set_seed(seed)  # Reset seed for reproducibility
     
     for i in range(sample_batches):
+        conditioning_values = None
+        conditioning_mask = None
+        if conditioning_length > 0:
+            conditioning_mask = torch.zeros(
+                samples_per_batch, seq_len, dtype=torch.bool, device=diffusion.device
+            )
+            conditioning_mask[:, :conditioning_length] = True
+            if conditioning_source is not None:
+                indices = torch.arange(samples_per_batch) % conditioning_source.size(0)
+                conditioning_values = conditioning_source[indices]
+            else:
+                indices = torch.randint(0, normalized_data.size(0), (samples_per_batch,))
+                conditioning_values = normalized_data[indices]
+            conditioning_values = conditioning_values.to(diffusion.device)
+            conditioning_values = conditioning_values.clone()
+            conditioning_values[:, conditioning_length:] = 0.0
+
         # Pass save_timesteps parameter to sample method for early stopping evaluation
         progress_desc = f"Sampling batch {i+1}/{sample_batches}"
         samples = diffusion.sample(
@@ -327,6 +370,8 @@ def train_model(
             save_timesteps=save_timesteps,
             start_idx=0,
             end_idx=seq_len,
+            conditioning=conditioning_values,
+            conditioning_mask=conditioning_mask,
             show_progress=True,
             progress_desc=progress_desc,
         )
@@ -374,6 +419,10 @@ if __name__ == "__main__":
                       help="Start index (inclusive) for sequential sampling window")
     parser.add_argument("--sample_window_length", type=int, default=None,
                       help="Number of indices to generate in the sampling window")
+    parser.add_argument("--conditioning_path", type=str, default=None,
+                      help="Path to a conditioning sequence file for sampling")
+    parser.add_argument("--conditioning_length", type=int, default=None,
+                      help="Number of prefix entries to condition on during sampling")
     parser.add_argument("--checkpoint_path", type=str, default=None,
                       help="Path to a checkpoint file to load before training/sampling")
     parser.add_argument("--skip_training", action="store_true",
@@ -390,6 +439,8 @@ if __name__ == "__main__":
         args.save_timesteps,
         args.sample_window_start,
         args.sample_window_length,
+        args.conditioning_path,
+        args.conditioning_length,
         args.checkpoint_path,
         args.skip_training,
     )

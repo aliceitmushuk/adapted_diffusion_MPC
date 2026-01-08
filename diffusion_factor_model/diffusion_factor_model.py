@@ -1353,6 +1353,8 @@ class SequentialGaussianDiffusion(Module):
         batch_size=16,
         save_timesteps=None,
         return_all_timesteps=False,
+        conditioning=None,
+        conditioning_mask=None,
         start_idx=0,
         end_idx=None,
         show_progress=False,
@@ -1370,6 +1372,26 @@ class SequentialGaussianDiffusion(Module):
             )
 
         sequences = torch.zeros(batch_size, self.seq_len, device=self.device)
+        if conditioning is not None:
+            conditioning = conditioning.to(self.device)
+            if conditioning.dim() == 1:
+                conditioning = conditioning.unsqueeze(0)
+            if conditioning.shape != sequences.shape:
+                raise ValueError(
+                    "conditioning must have shape [batch_size, seq_len] or [seq_len]"
+                )
+            if conditioning_mask is None:
+                raise ValueError("conditioning_mask is required when conditioning is provided")
+            if conditioning_mask.dim() == 1:
+                conditioning_mask = conditioning_mask.unsqueeze(0).expand_as(sequences)
+            if conditioning_mask.shape != sequences.shape:
+                raise ValueError("conditioning_mask must match conditioning shape")
+            conditioning_mask = conditioning_mask.bool()
+            if not (conditioning_mask == conditioning_mask[0]).all():
+                raise ValueError("conditioning_mask must be identical across the batch")
+            sequences = torch.where(conditioning_mask, conditioning, sequences)
+        elif conditioning_mask is not None:
+            raise ValueError("conditioning_mask provided without conditioning values")
         sample_pos = self._ddim_step if self.is_ddim_sampling else self._ddpm_step
 
         if end_idx is None:
@@ -1379,7 +1401,15 @@ class SequentialGaussianDiffusion(Module):
         if start_idx >= end_idx:
             raise ValueError("Sampling window must include at least one index")
 
-        indices_to_generate = list(range(start_idx, end_idx))
+        if conditioning_mask is not None:
+            conditioned_positions = conditioning_mask[0].bool()
+            indices_to_generate = [
+                pos
+                for pos in range(start_idx, end_idx)
+                if not conditioned_positions[pos].item()
+            ]
+        else:
+            indices_to_generate = list(range(start_idx, end_idx))
         iterator = indices_to_generate
         if show_progress:
             iterator = tqdm(
@@ -1721,4 +1751,3 @@ class Trainer:
                     self.best_fid = fid_score
                     self.save("best")
                 self.save("latest")
-
