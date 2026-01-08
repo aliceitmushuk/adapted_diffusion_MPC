@@ -51,9 +51,7 @@ def train_model(
     """
     # Set GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
-    if cli_args is None:
-        cli_args = {}
+    cli_args_logged = cli_args if cli_args is not None else {}
 
     def get_git_metadata():
         """Return commit hash plus dirty state and optional status/diff snapshots."""
@@ -218,7 +216,7 @@ def train_model(
     metadata = {
         "commit_hash": commit_hash,
         "commit_dirty": git_info["dirty"],
-        "cli_args": cli_args if cli_args is not None else {},
+        "cli_args": cli_args_logged,
         "config": config_snapshot,
     }
     try:
