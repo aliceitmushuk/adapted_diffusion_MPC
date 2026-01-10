@@ -1278,8 +1278,25 @@ class SequentialGaussianDiffusion(Module):
     def forward(self, sequences, *args, **kwargs):
         batch, seq_len = sequences.shape
         assert seq_len == self.seq_len, f'sequence length must be {self.seq_len}'
+        conditioning_mask = kwargs.pop("conditioning_mask", None)
         t = torch.randint(0, self.num_timesteps, (batch,), device=sequences.device).long()
-        target_indices = torch.randint(0, self.seq_len, (batch,), device=sequences.device).long()
+        if conditioning_mask is None:
+            target_indices = torch.randint(0, self.seq_len, (batch,), device=sequences.device).long()
+        else:
+            if conditioning_mask.dim() == 1:
+                conditioning_mask = conditioning_mask.unsqueeze(0).expand(batch, -1)
+            conditioning_mask = conditioning_mask.to(sequences.device)
+            if conditioning_mask.shape != sequences.shape:
+                raise ValueError("conditioning_mask must match sequences shape")
+            conditioning_mask = conditioning_mask.bool()
+            target_indices = []
+            for idx in range(batch):
+                available = torch.nonzero(~conditioning_mask[idx], as_tuple=False).squeeze(-1)
+                if available.numel() == 0:
+                    raise ValueError("conditioning_mask must leave at least one index to train on")
+                choice = available[torch.randint(0, available.numel(), (1,), device=sequences.device)]
+                target_indices.append(choice)
+            target_indices = torch.stack(target_indices).squeeze(-1)
         return self.p_losses(sequences, t, target_indices, *args, **kwargs)
 
     def _build_ddim_time_pairs(self):
@@ -1539,7 +1556,8 @@ class Trainer:
         calculate_fid=False,
         num_fid_samples=0,
         save_best_and_latest_only=False,
-        save_timesteps=None  # Specific timesteps to save for early stopping evaluation
+        save_timesteps=None,  # Specific timesteps to save for early stopping evaluation
+        conditioning_mask=None
     ):
         super().__init__()
 
@@ -1620,6 +1638,7 @@ class Trainer:
         self.num_samples = num_samples
         self.num_fid_samples = num_fid_samples
         self.save_timesteps = save_timesteps  # Store timesteps for early stopping evaluation
+        self.conditioning_mask = conditioning_mask
 
         # Model checkpoint and result saving
         self.results_folder = Path(results_folder)
@@ -1679,7 +1698,7 @@ class Trainer:
 
                     # Forward pass with gradient accumulation
                     with self.accelerator.autocast():
-                        loss = self.model(data)
+                        loss = self.model(data, conditioning_mask=self.conditioning_mask)
                         batch_loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 

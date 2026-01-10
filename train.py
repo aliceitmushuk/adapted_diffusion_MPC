@@ -30,6 +30,7 @@ def train_model(
     sample_window_length=None,
     conditioning_path=None,
     conditioning_length=None,
+    training_conditioning_length=None,
     checkpoint_path=None,
     skip_training=False,
     cli_args=None,
@@ -49,6 +50,7 @@ def train_model(
         sample_window_length: Optional number of sequential entries to generate
         conditioning_path: Optional path to a conditioning sequence file for sampling
         conditioning_length: Optional number of prefix entries to condition on during sampling
+        training_conditioning_length: Optional number of prefix entries to condition on during training
         checkpoint_path: Optional path to a saved checkpoint to load before training/sampling
         skip_training: If True, load the checkpoint (if provided) and skip training to only run sampling
         cli_args: Optional dictionary of CLI arguments for logging
@@ -259,6 +261,16 @@ def train_model(
     if conditioning_length < 0 or conditioning_length > seq_len:
         raise ValueError("conditioning_length must be between 0 and the sequence length")
 
+    if training_conditioning_length is None:
+        training_conditioning_length = conditioning_length
+    training_conditioning_length = int(training_conditioning_length)
+    if training_conditioning_length < 0 or training_conditioning_length > seq_len:
+        raise ValueError("training_conditioning_length must be between 0 and the sequence length")
+    training_conditioning_mask = None
+    if training_conditioning_length > 0:
+        training_conditioning_mask = torch.zeros(seq_len, dtype=torch.bool)
+        training_conditioning_mask[:training_conditioning_length] = True
+
     # Use epochs from argument or config
     if epochs is None:
         epochs = config.EPOCHS
@@ -314,6 +326,7 @@ def train_model(
         param_path="",
         amp=config.USE_AMP,
         save_timesteps=save_timesteps,  # Pass save_timesteps for early stopping evaluation
+        conditioning_mask=training_conditioning_mask,
     )
 
     print("Trainer initialized")
@@ -421,6 +434,8 @@ if __name__ == "__main__":
                       help="Path to a conditioning sequence file for sampling")
     parser.add_argument("--conditioning_length", type=int, default=None,
                       help="Number of prefix entries to condition on during sampling")
+    parser.add_argument("--training_conditioning_length", type=int, default=None,
+                      help="Number of prefix entries to condition on during training")
     parser.add_argument("--checkpoint_path", type=str, default=None,
                       help="Path to a checkpoint file to load before training/sampling")
     parser.add_argument("--skip_training", action="store_true",
@@ -439,6 +454,7 @@ if __name__ == "__main__":
         args.sample_window_length,
         args.conditioning_path,
         args.conditioning_length,
+        args.training_conditioning_length,
         args.checkpoint_path,
         args.skip_training,
         cli_args=vars(args),
