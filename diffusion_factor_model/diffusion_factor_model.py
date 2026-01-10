@@ -524,6 +524,34 @@ class ConditionalTransformer(Module):
         target_states = encoded[torch.arange(batch, device=device), target_indices + offset]
         return self.output(target_states).squeeze(-1)
 
+# Separate MLP for unconditional first-value prediction
+class FirstValueMLP(Module):
+    """Predicts the denoising target for the first entry without conditioning."""
+
+    def __init__(self, dim=128, hidden_mult=2, dropout=0.1):
+        super().__init__()
+        hidden_dim = int(dim * hidden_mult)
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(dim),
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim + 1),
+            nn.Linear(dim + 1, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x_t, timesteps):
+        time_emb = self.time_mlp(timesteps.float())
+        features = torch.cat([x_t.unsqueeze(-1), time_emb], dim=-1)
+        return self.net(features).squeeze(-1)
+
 # gaussian diffusion trainer class
 
 def extract(a, t, x_shape):
@@ -1126,11 +1154,24 @@ class SequentialGaussianDiffusion(Module):
         beta_schedule='cosine',
         schedule_fn_kwargs=dict(),
         auto_normalize=False,
+        first_value_dim=None,
+        first_value_hidden_mult=2,
+        first_value_dropout=0.1,
     ):
         super().__init__()
         self.model = model
         self.seq_len = seq_len
         self.objective = objective
+        if first_value_dim is None:
+            if hasattr(model, "value_proj"):
+                first_value_dim = model.value_proj.out_features
+            else:
+                first_value_dim = 128
+        self.first_value_model = FirstValueMLP(
+            dim=first_value_dim,
+            hidden_mult=first_value_hidden_mult,
+            dropout=first_value_dropout,
+        )
 
         if beta_schedule == 'linear':
             beta_schedule_fn = linear_beta_schedule
@@ -1262,8 +1303,22 @@ class SequentialGaussianDiffusion(Module):
         noise = default(noise, lambda: torch.randn(batch, device=self.device))
         target = sequences[torch.arange(batch, device=self.device), target_indices]
         noisy_target = self.q_sample(target, t, noise)
-        context, key_padding_mask = self.build_context(sequences, target_indices, noisy_target)
-        pred = self.model(context, target_indices, t, key_padding_mask)
+        pred = torch.empty_like(target)
+        first_mask = target_indices == 0
+        if first_mask.any():
+            pred[first_mask] = self.first_value_model(noisy_target[first_mask], t[first_mask])
+        if (~first_mask).any():
+            context, key_padding_mask = self.build_context(
+                sequences[~first_mask],
+                target_indices[~first_mask],
+                noisy_target[~first_mask],
+            )
+            pred[~first_mask] = self.model(
+                context,
+                target_indices[~first_mask],
+                t[~first_mask],
+                key_padding_mask,
+            )
 
         if self.objective == 'pred_noise':
             target_value = noise
@@ -1332,20 +1387,40 @@ class SequentialGaussianDiffusion(Module):
 
         return pred_noise, x_start
 
+    def _first_value_predictions(self, x_t, times):
+        model_out = self.first_value_model(x_t, times)
+
+        if self.objective == 'pred_noise':
+            x_start = self.predict_start_from_noise(x_t, times, model_out)
+            pred_noise = self.predict_noise_from_start(x_t, times, x_start)
+        elif self.objective == 'pred_x0':
+            x_start = model_out
+            pred_noise = self.predict_noise_from_start(x_t, times, x_start)
+        elif self.objective == 'pred_v':
+            x_start = self.predict_start_from_v(x_t, times, model_out)
+            pred_noise = self.predict_noise_from_start(x_t, times, x_start)
+        else:
+            raise ValueError(f'unknown objective {self.objective}')
+
+        return pred_noise, x_start
+
     def _ddpm_step(self, sequences, pos):
         batch_size = sequences.size(0)
         x_t = torch.randn(batch_size, device=self.device)
         target_indices = torch.full((batch_size,), pos, device=self.device, dtype=torch.long)
         for t in reversed(range(self.num_timesteps)):
             times = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
-            context, key_padding_mask = self.build_context(sequences, target_indices, x_t)
-            pred_noise, x_start = self._model_predictions(
-                context,
-                key_padding_mask,
-                target_indices,
-                x_t,
-                times,
-            )
+            if pos == 0:
+                pred_noise, x_start = self._first_value_predictions(x_t, times)
+            else:
+                context, key_padding_mask = self.build_context(sequences, target_indices, x_t)
+                pred_noise, x_start = self._model_predictions(
+                    context,
+                    key_padding_mask,
+                    target_indices,
+                    x_t,
+                    times,
+                )
             if t == 0:
                 x_t = x_start
             else:
@@ -1362,14 +1437,17 @@ class SequentialGaussianDiffusion(Module):
 
         for time, time_next in time_pairs:
             time_cond = torch.full((batch_size,), time, device=self.device, dtype=torch.long)
-            context, key_padding_mask = self.build_context(sequences, target_indices, x_t)
-            pred_noise, x_start = self._model_predictions(
-                context,
-                key_padding_mask,
-                target_indices,
-                x_t,
-                time_cond,
-            )
+            if pos == 0:
+                pred_noise, x_start = self._first_value_predictions(x_t, time_cond)
+            else:
+                context, key_padding_mask = self.build_context(sequences, target_indices, x_t)
+                pred_noise, x_start = self._model_predictions(
+                    context,
+                    key_padding_mask,
+                    target_indices,
+                    x_t,
+                    time_cond,
+                )
 
             if time_next < 0:
                 x_t = x_start
