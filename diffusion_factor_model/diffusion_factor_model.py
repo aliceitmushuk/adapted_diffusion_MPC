@@ -448,10 +448,16 @@ class ConditionalTransformer(Module):
         ff_mult=4,
         dropout=0.1,
         use_bos_token=False,
+        use_alibi=False,
+        alibi_slope=1.0,
+        first_token_bias=0.0,
     ):
         super().__init__()
         self.seq_len = seq_len
         self.use_bos_token = use_bos_token
+        self.use_alibi = use_alibi
+        self.alibi_slope = alibi_slope
+        self.first_token_bias = first_token_bias
         self.value_proj = nn.Linear(1, dim)
         self.indicator_embed = nn.Embedding(2, dim)
         self.time_mlp = nn.Sequential(
@@ -477,6 +483,16 @@ class ConditionalTransformer(Module):
         mask = torch.triu(torch.ones(emb_len, emb_len), diagonal=1)
         mask = mask.masked_fill(mask == 1, float('-inf'))
         self.register_buffer('causal_mask', mask)
+        if self.use_alibi or self.first_token_bias != 0.0:
+            positions = torch.arange(emb_len)
+            distances = positions.unsqueeze(0) - positions.unsqueeze(1)
+            distances = distances.clamp_min(0).float()
+            alibi_bias = torch.zeros(emb_len, emb_len)
+            if self.use_alibi:
+                alibi_bias -= self.alibi_slope * distances
+            if self.first_token_bias != 0.0:
+                alibi_bias[:, 0] += self.first_token_bias
+            self.register_buffer('alibi_bias', alibi_bias)
         self.dropout = nn.Dropout(dropout)
         # Small prediction head so representation and scalar output can live in different spaces
         # Empirically, stacking two hidden layers stabilizes gradients, so keep both.
@@ -518,6 +534,8 @@ class ConditionalTransformer(Module):
         tokens[torch.arange(batch, device=device), target_indices + offset] += time_emb
         tokens = self.dropout(tokens)
         mask = self.causal_mask[:seq_len_tokens, :seq_len_tokens]
+        if self.use_alibi or self.first_token_bias != 0.0:
+            mask = mask + self.alibi_bias[:seq_len_tokens, :seq_len_tokens]
         if self.use_bos_token:
             key_padding_mask = F.pad(key_padding_mask, (1, 0), value=False)
         encoded = self.encoder(tokens, mask=mask, src_key_padding_mask=key_padding_mask)

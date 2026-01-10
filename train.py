@@ -284,6 +284,9 @@ def train_model(
         ff_mult=config.TRANSFORMER_FF_MULT,
         dropout=config.TRANSFORMER_DROPOUT,
         use_bos_token=config.USE_BOS_TOKEN,
+        use_alibi=config.USE_ALIBI,
+        alibi_slope=config.ALIBI_SLOPE,
+        first_token_bias=config.FIRST_TOKEN_BIAS,
     )
 
     print("Model initialized")

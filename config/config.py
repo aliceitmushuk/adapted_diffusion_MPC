@@ -36,6 +36,9 @@ TRANSFORMER_HEADS = 8
 TRANSFORMER_FF_MULT = 4
 TRANSFORMER_DROPOUT = 0.1
 USE_BOS_TOKEN = True
+USE_ALIBI = False
+ALIBI_SLOPE = 1.0
+FIRST_TOKEN_BIAS = 0.0
 
 # Dimension multipliers for different input sizes
 DIM_MULTS_LARGE = (1, 2, 4, 16)     # For inputs where min_dim >= 32
