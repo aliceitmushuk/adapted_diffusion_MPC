@@ -173,8 +173,19 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 .jupyter_ystore.db
+<<<<<<< HEAD
 
 /samples
 /model_results
 /data
 /figs
+=======
+model_results/
+samples/
+Evalution_factor.ipynb
+config/config.py
+model_results/
+samples/
+
+*.npy
+>>>>>>> origin/main
