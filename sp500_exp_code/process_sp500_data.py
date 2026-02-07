@@ -3,6 +3,16 @@ import numpy as np
 import torch
 import os
 
+def set_seed(seed=None):
+    """Set random seed for reproducibility"""  
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
+    return seed
+
+seed = 3407
+set_seed(seed)
+
 ## Create data directory
 data_dir = './data/sp500/'
 os.makedirs(data_dir, exist_ok=True)
@@ -21,11 +31,11 @@ sample_path /= sample_path[:, [0]] # normalize the price path by the initial pri
 
 ## Save the first 40 training paths (1989-2010) for training the SDE generative model
 # torch.save(torch.tensor(sample_path), f'{data_dir}train_sde_path.pt')
-np.save(f'{data_dir}train_sde_path.npy', sample_path)
+# np.save(f'{data_dir}train_sde_path.npy', sample_path)
 
 ## Save the entire training price trajectory (1990-2010)
 train_price = raw_data.iloc[:5041]['Close'].to_numpy()[:, 0]
-torch.save(torch.tensor(train_price), f'{data_dir}train_price_path.pt')
+# torch.save(torch.tensor(train_price), f'{data_dir}train_price_path.pt')
 
 
 ## Generate test paths from 2010 to 2019 by return block bootstrapping
@@ -34,7 +44,7 @@ test_return = (test_price[1:] - test_price[:-1]) / test_price[:-1]
 test_return = test_return.reshape(-1, 21)
 num_month = test_return.shape[0]
 test_path = []
-for _ in range(5000):
+for _ in range(100000):
     month_idx = np.random.randint(0, num_month, 6)  # sample indices of 6 months
     temp_start = torch.tensor([test_price[month_idx[0] * 21]])  # starting price of the first month
     temp_return = torch.from_numpy(test_return[month_idx].reshape(-1))  # sampled returns
@@ -46,7 +56,7 @@ for i in range(1, test_path.shape[1]):
 test_path /= test_path[:, [0]]  # normalize the price path by the initial price
 
 ## Save the generated test paths
-torch.save(torch.tensor(test_path), f'{data_dir}test_path_2010_2019.pt')
+torch.save(torch.tensor(test_path), f'{data_dir}test_path_2010_2019_seed{seed}.pt')
 
 
 
