@@ -1,84 +1,151 @@
-# 🌊 Diffusion Factor Model
+# Diffusion Factor Model
 
 <p align="center">
-  <img src="assets/demo.png" alt="Diffusion Factor Model Demo" width="700"/>
+  <img src="assets/demo.png" alt="Diffusion Factor Model demo" width="700"/>
 </p>
 
-This repository implements a Diffusion Factor Model for financial data.
+A sequential diffusion framework for modeling and generating high-dimensional financial return series with latent factor structure.
 
-## 📝 Summary
+## Overview
 
-Diffusion Factor Model (DFM) is a novel approach that adapts diffusion models to generate new financial returns with realistic factor structure. It achieves superior performance in preserving the statistical properties and latent factor patterns of financial data, making it valuable for portfolio optimization and risk management applications.
+This repository trains a **conditional transformer + Gaussian diffusion** model on `.npy` return data and generates synthetic samples for downstream analysis (distribution matching, factor recovery, and portfolio evaluation).
 
-## ✨ Features
+Compared with earlier versions in the commit history, the current training workflow adds:
 
-- 📊 Diffusion models adapted for financial data with factor structure
-- 🔄 Support for both simulation data (num_samples, height, width) and empirical data (num_samples, length) formats
-- 📐 Automatic adaptation to different input dimensions
-- 💹 Portfolio optimization evaluation framework
-- 📈 Factor recovery evaluation metrics
+- Sequential transformer-based diffusion training
+- Sampling window controls for partial-sequence generation
+- Optional prefix conditioning during sampling
+- Optional checkpoint loading and sampling-only runs
+- Reproducibility metadata (commit hash, dirty status, CLI/config snapshot)
+- Optional architectural controls such as BOS token and ALiBi-style positional bias (via config)
 
-## 🔧 Installation
+## Repository structure
+
+```text
+.
+├── config/                         # Hyperparameters and runtime paths
+├── diffusion_factor_model/         # Core model, diffusion process, trainer
+├── eval/                           # Evaluation modules and notebooks
+├── simulation_experiment_data/     # Example simulation training data
+├── empirical_analysis_data/        # Example empirical training data
+├── train.py                        # Main entry point for training/sampling
+├── model_results/                  # Created automatically (checkpoints + run metadata)
+└── samples/                        # Created automatically (generated .npy batches)
+```
+
+## Installation
 
 ```bash
 git clone https://github.com/xymmmm00/diffusion_factor_model.git
-cd diffusion-factor-model
+cd diffusion_factor_model
 pip install -r requirements.txt
 ```
 
-For portfolio optimization, MOSEK requires a license (free for academic use).
+## Data format
 
-## 📁 Project Structure
+`train.py` expects a NumPy array saved as `.npy` with shape:
 
-```
-diffusion-factor-model/
-├── config/                      # Configuration settings
-├── diffusion_factor_model/      # Core model implementation
-├── eval/                        # Evaluation modules
-├── simulation_experiment_data/  # Simulation data storage
-├── empirical_analysis_data/     # Empirical data storage
-├── model_results/               # Trained models (created automatically)
-├── samples/                     # Generated samples (created automatically)
-└── train.py                     # Main training script
-```
+- `(num_samples, sequence_length)` (recommended)
+- `(sequence_length,)` (auto-expanded to one sample)
+- Higher-dimensional arrays are flattened to `(num_samples, -1)`
 
-## 🚀 Training
+Examples are included at:
 
-The training script automatically detects data format and adapts the model architecture accordingly.
+- `simulation_experiment_data/training_data_example.npy`
+- `empirical_analysis_data/training_data_example.npy`
+
+## Training and sampling
+
+Minimal run:
 
 ```bash
-# Train with simulation data:
-python train.py --data_path /path/to/simulation_experiment_data/training_data_example.npy --seed 42 --gpu 0
-
-# Train with empirical data:
-python train.py --data_path /path/to/empirical_analysis_data/training_data_example.npy --seed 42 --gpu 0
+python train.py \
+  --data_path simulation_experiment_data/training_data_example.npy \
+  --seed 42 \
+  --gpu 0
 ```
 
-### Supported Data Formats
+Run with explicit controls:
 
-1. **Empirical data**: Shape `(samples, assets)` - e.g., `(1024, 512)` 
-2. **Simulation data**: Shape `(samples, height, width)` - e.g., `(512, 32, 64)`
+```bash
+python train.py \
+  --data_path empirical_analysis_data/training_data_example.npy \
+  --seed 42 \
+  --gpu 0 \
+  --epochs 500 \
+  --num_samples 1024 \
+  --sample_window_start 0 \
+  --sample_window_length 256 \
+  --save_timesteps 20 50 100
+```
 
-## 📊 Evaluation
+Conditioned sampling (prefix known, remainder generated):
 
-The repository includes evaluation modules for:
+```bash
+python train.py \
+  --data_path empirical_analysis_data/training_data_example.npy \
+  --conditioning_path empirical_analysis_data/training_data_example.npy \
+  --conditioning_length 64 \
+  --gpu 0
+```
 
-1. **Mean and Covariance Calculation** - With winsorization and shrinkage estimation
-2. **Simulation Evaluation** - Comparing generated distributions (both return and latent subspace) with ground truth
-3. **Mean-Variance Portfolio Evaluation** - Creating mean-variance portfolios with performance metrics
-4. **Factor Timing Portfolio Evaluation** - Using PCA, POET, RP-PCA for factor-based portfolios
+Sampling-only from a saved checkpoint:
+
+```bash
+python train.py \
+  --data_path empirical_analysis_data/training_data_example.npy \
+  --checkpoint_path model_results/<experiment_id>/model-*.pt \
+  --skip_training \
+  --gpu 0
+```
+
+## CLI arguments (`train.py`)
+
+- `--data_path` (required): training data `.npy` path
+- `--seed`: random seed (default from `config`)
+- `--num_samples`: truncate training set to first N samples
+- `--gpu`: CUDA device id (sets `CUDA_VISIBLE_DEVICES`)
+- `--epochs`: override config epoch count
+- `--save_timesteps`: save selected denoising timesteps during sampling
+- `--sample_window_start`: start index (inclusive) for training/sampling window
+- `--sample_window_length`: number of indices in the selected window
+- `--conditioning_path`: optional conditioning sequence `.npy`
+- `--conditioning_length`: conditioned prefix length
+- `--checkpoint_path`: checkpoint to load before training/sampling
+- `--skip_training`: skip optimization and run sampling only (requires checkpoint)
+
+## Outputs and reproducibility
+
+Each run creates an experiment directory under `model_results/dfm_<data>_ts<timestamp>_seed<seed>/` and stores:
+
+- model checkpoints
+- `commit_hash.txt`
+- `run_config.json` (CLI args + config snapshot)
+- `git_status.txt` and `git_diff.patch` when running on a dirty working tree
+
+Generated samples are saved under `samples/<experiment_id>/sample_batch*.npy`.
+
+## Evaluation
+
+Evaluation utilities live in `eval/`, including:
+
+- `simulation_eval.py` for simulation distribution/subspace checks
+- `mean_cov.py` for mean-covariance estimation helpers
+- `mv_portfolio_eval.py` for mean-variance portfolio metrics
+- `ft_portfolio_eval.py` for factor-timing portfolio evaluation
+- notebooks (`ARMA.ipynb`, `GP.ipynb`, `QQplot.ipynb`) for exploratory analyses
 
 <p align="center">
-  <img src="assets/distribution_example.png">
+  <img src="assets/distribution_example.png" alt="distribution example" width="700"/>
 </p>
 
 <p align="center">
-  <img src="assets/portfolio_example.png">
+  <img src="assets/portfolio_example.png" alt="portfolio example" width="700"/>
 </p>
 
-## 📚 Citation
+## Citation
 
-```
+```bibtex
 @article{chen2025diffusion,
   title={Diffusion Factor Models: Generating High-Dimensional Returns with Factor Structure},
   author={Chen, Minshuo and Xu, Renyuan and Xu, Yumin and Zhang, Ruixun},
